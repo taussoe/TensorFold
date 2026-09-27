@@ -19,6 +19,8 @@ The gate/up epilogue is GLM's limited SwiGLU: bf16(bf16(silu(min(g, L))) * clip(
 
 from __future__ import annotations
 
+import os
+
 from dataclasses import dataclass
 
 import torch
@@ -133,10 +135,12 @@ def split_k(n: int, k: int) -> int:
 
 
 def bucket(m: int) -> int:
+    """Row block for m rows. Past 128 rows (long prefill chunks) the kernel runs 128-row blocks side by side: a
+    row's arithmetic is the same in any block size, so this changes speed, never bits."""
     for b in (16, 32, 64, 128):
         if m <= b:
             return b
-    raise ValueError(f"at most 128 rows, got {m}")
+    return 128
 
 
 def gpi_for(per: int, want: int) -> int:
@@ -530,11 +534,25 @@ def _moe_down(ACT, AXS, DW, DS, DB, UIDS, UCOUNT, UMEM, Y,
 MOE_CFG = {"gateup": (16, 2, 4, 2), "down": (16, 2, 4, 2)}
 
 
+# Member tiles that give a (row, expert) pair the same bits: measured, 16 and 32 agree, 64 does not (its tensor-core
+# instruction sums in another order). tests/cuda/test_glm_prefill_rows.py checks it.
+EXACT_MEMBER_TILES = (16, 32)
+
+
+def member_tile(rows: int, default: int) -> int:
+    """Rows of an expert per program. Decode windows (a few rows) keep the tuned 16; prefill chunks, where each
+    expert gets dozens of rows, use 32 so its weights are read half as often. Bits are the same either way."""
+    tile = int(os.environ.get("TF_GLM_MOE_TILE", 32 if rows > 128 else default))
+    if tile not in EXACT_MEMBER_TILES:
+        raise ValueError(f"TF_GLM_MOE_TILE={tile}: only {EXACT_MEMBER_TILES} keep drafted replies equal to serial ones")
+    return tile
+
+
 def moe_gateup(x: torch.Tensor, xs: torch.Tensor, ex: Experts, group: Group, act: torch.Tensor,
                axs: torch.Tensor, limit: float, *, bm: int | None = None, gpi: int | None = None,
                num_warps: int | None = None, num_stages: int | None = None) -> None:
     c_bm, c_gpi, c_w, c_s = MOE_CFG["gateup"]
-    bm, gpi, num_warps, num_stages = bm or c_bm, gpi or c_gpi, num_warps or c_w, num_stages or c_s
+    bm, gpi, num_warps, num_stages = bm or member_tile(x.shape[0], c_bm), gpi or c_gpi, num_warps or c_w, num_stages or c_s
     maxm = group.members.shape[1]
     grid = (group.ids.shape[0], ex.width // BN, triton.cdiv(maxm, bm))
     _moe_gateup[grid](x, xs, x.stride(0), ex.gw, ex.gs, ex.gb, ex.uw, ex.us, ex.ub, group.ids, group.count,
@@ -547,7 +565,8 @@ def moe_down(act: torch.Tensor, axs: torch.Tensor, ex: Experts, group: Group, y:
              bm: int | None = None, gpi: int | None = None, num_warps: int | None = None,
              num_stages: int | None = None) -> None:
     c_bm, c_gpi, c_w, c_s = MOE_CFG["down"]
-    bm, gpi, num_warps, num_stages = bm or c_bm, gpi or c_gpi, num_warps or c_w, num_stages or c_s
+    bm, gpi, num_warps, num_stages = (bm or member_tile(group.members.shape[1], c_bm), gpi or c_gpi,
+                                      num_warps or c_w, num_stages or c_s)
     maxm = group.members.shape[1]
     grid = (group.ids.shape[0], ex.dims // BN, triton.cdiv(maxm, bm))
     _moe_down[grid](act, axs, ex.dw, ex.ds, ex.db, group.ids, group.count, group.members, y,

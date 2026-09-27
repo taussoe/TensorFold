@@ -19,6 +19,7 @@ import torch
 
 from tensorfold.engine.exact_sampling import MARGIN, Sampling, choose_rows
 
+from . import glue, prof, qmm
 from .forward import Buffers, State, chunks_for, commit, compute, stage
 from .mtp import mtp_compute, mtp_stage
 from .weights import Weights
@@ -241,6 +242,14 @@ def restore(e: Engine, snap: Snapshot, drafter=None) -> None:
 
 # -- prefill ----------------------------------------------------------------------------------------------------
 @torch.no_grad()
+def last_logits(w: Weights, b: Buffers, R: int) -> torch.Tensor:
+    """After ``compute(logits=False)``: the final norm for every row (the MTP head reads those rows, see
+    ``Engine.main_hidden``) and the head for row R - 1 alone, the only row a prefill chunk samples from. Same bits
+    as ``compute`` (row-invariant kernels), without the other rows' logits (~0.3 TFLOP in a 1024-row chunk)."""
+    glue.rmsnorm(b.hidden[:R], w.norm, w.cfg.eps, b.fnormed[:R], b.fxs[:R])
+    return qmm.matmul(b.fnormed[R - 1:R], w.head, b.fxs[R - 1:R], out=b.logits[R - 1:R], part=b.sk)
+
+
 def prefill(e: Engine, prompt: Sequence[int], sampling: Sampling | None, *, mtp: bool = True, drafter=None,
             resume: Snapshot | None = None) -> int:
     """Commit the prompt in chains of up to ``prefill_rows`` rows (the MTP cache absorbing every position whose
@@ -268,19 +277,24 @@ def prefill(e: Engine, prompt: Sequence[int], sampling: Sampling | None, *, mtp:
             k = resume.pending.shape[0]
             absorb(e, resume.pending, list(prompt[begin - k + 1:begin + 1]))
     last = None
+    prof.active = True
     for start in range(begin, len(prompt), e.prefill_rows):
         chunk = list(prompt[start:start + e.prefill_rows])
         R = len(chunk)
-        logits = compute(w, st, b, stage(w, st, b, chunk), nch=chunks_for(st, R), host_pos=st.pos)
-        last = logits[R - 1:R].clone()
+        compute(w, st, b, stage(w, st, b, chunk), logits=False, nch=chunks_for(st, R), host_pos=st.pos)
+        last = last_logits(w, b, R).clone()
         e.last_hidden = e.main_hidden(slice(R - 1, R)).clone()
         if use_mtp:
             nxt = list(prompt[start + 1:start + R + 1])
             if nxt:
-                absorb(e, e.main_hidden(slice(0, len(nxt))), nxt)
+                with prof.timed("mtp absorb"):
+                    absorb(e, e.main_hidden(slice(0, len(nxt))), nxt)
         if drafter is not None:
             drafter.add_taps(e.tap_rows(R))
-        commit(w, st, b, R, R)
+        with prof.timed("commit"):
+            commit(w, st, b, R, R)
+    prof.active = False
+    prof.report(len(prompt) - begin)
     return e.sample(last, [len(prompt)], sampling)[0]
 
 

@@ -32,6 +32,8 @@ A request's draft policy is a spec (the engine's default, or the request's throu
 
 from __future__ import annotations
 
+import os
+
 import hashlib
 import json
 import struct
@@ -138,7 +140,11 @@ class GlmEngine:
         self.comm = comm if comm is not None else NCCL(rank, 2, master, port)
         self.comm.barrier()
         # both ranks must run the same calls: refuse to start when they were given different settings
-        mine = [int(drafter is not None), capacity, int(long_context), int(serial_only)]
+        from . import latent
+
+        prefill_rows = int(os.environ.get("TF_GLM_PREFILL_ROWS", "64"))
+        mine = [int(drafter is not None), capacity, int(long_context), int(serial_only), int(latent.ENABLED),
+                prefill_rows]
         both = self._gather_ints(mine)
         if both[0] != both[1]:
             raise RuntimeError("the two ranks were started with different settings (draft model, context, drafts): "
@@ -157,7 +163,7 @@ class GlmEngine:
             from .dflash2 import Drafter
 
             self.drafter = Drafter(drafter, w, capacity=capacity)
-        self.e = Engine(w, capacity=capacity, max_rows=MAX_ROWS, prefill_rows=64, graphs=True, graph_rows=GRAPH_ROWS,
+        self.e = Engine(w, capacity=capacity, max_rows=MAX_ROWS, prefill_rows=prefill_rows, graphs=True, graph_rows=GRAPH_ROWS,
                         long_context=long_context, taps=self.drafter.tap_layers if self.drafter is not None else ())
         if self.drafter is not None:
             self.drafter.capture()
