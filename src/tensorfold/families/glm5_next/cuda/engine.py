@@ -178,7 +178,14 @@ class GlmEngine:
                   f"DFlash2 block {c['block']:.2f} (+{c['taps_row']:.3f} a tap row)", flush=True)
         self.eos = tuple(w.cfg.eos)
         self.request = threading.local()    # the calling request's policy and stop-at-EOS (``app.GlmApp``)
-        self.cache: list = []               # decode.Snapshot entries, each a prefix of the next
+        # Prompt cache for several conversations (engine/ branch): decode.Snapshot entries, least recently used first.
+        # The live attention caches hold one sequence (self.live); a snapshot whose rows another conversation is
+        # about to overwrite gets them copied out first (decode.save_rows, ~20 KB a token on each rank), within
+        # TF_GLM_CACHE_GIB. Both ranks run the same requests in the same order, so they keep the same entries.
+        self.cache: list = []
+        self.live: list[int] = []
+        self.cache_bytes = int(float(os.environ.get("TF_GLM_CACHE_GIB", "8")) * 2 ** 30)
+        self.cache_entries = int(os.environ.get("TF_GLM_CACHE_ENTRIES", "32"))
 
     def _calibrate(self) -> dict:
         """Milliseconds for ``decode.DrafterChoice``, timed on random tokens as rounds use them and made the same on
@@ -313,8 +320,36 @@ class GlmEngine:
         return best
 
     def _remember(self, snap) -> None:
-        self.cache = [c for c in self.cache if len(c.ids) < len(snap.ids) and snap.ids[:len(c.ids)] == c.ids]
-        self.cache = self.cache[-1:] + [snap]
+        self.cache = [c for c in self.cache if c.ids != snap.ids] + [snap]
+        while len(self.cache) > self.cache_entries:
+            self.cache.pop(0)
+
+    def _take_over(self, keep: list[int]) -> None:
+        """Before the live caches are rewritten past ``keep`` (the resumed prefix): every snapshot whose rows live
+        there and are not a prefix of ``keep`` gets them saved, oldest dropped first when the budget is spent."""
+        from .decode import save_rows
+
+        live = self.live
+        for snap in list(self.cache):
+            n = len(snap.ids)
+            if snap.rows is not None or (n <= len(keep) and keep[:n] == snap.ids):
+                continue
+            if live[:n] != snap.ids:                  # its rows are already gone: nothing to resume from
+                self.cache.remove(snap)
+                continue
+            need = 20 * 1024 * n                         # about what save_rows copies (checked after)
+            while self._saved_bytes() + need > self.cache_bytes:
+                old = next((c for c in self.cache if c.rows is not None), None)
+                if old is None:
+                    break
+                self.cache.remove(old)
+            if self._saved_bytes() + need > self.cache_bytes:
+                self.cache.remove(snap)
+                continue
+            save_rows(self.e, snap)
+
+    def _saved_bytes(self) -> int:
+        return sum(c.nbytes for c in self.cache if c.rows is not None)
 
     def _run(self, prompt: list[int], max_tokens: int, sampling, stop_eos: bool, on_tokens: Callable[[list[int]], Any],
              code: list[int], hit, draft: bool) -> dict[str, Any]:
@@ -324,9 +359,16 @@ class GlmEngine:
         auto, use_mtp, use_dflash = self._drafters(code)
         drafter = self.drafter if use_dflash else None
         t0 = time.perf_counter()
-        # a request writes the attention caches from its resume point on: every longer snapshot is overwritten
+        # a request writes the attention caches from its resume point on: snapshots of other conversations get
+        # their rows saved first, and a saved snapshot resumed from gets its rows back
+        from .decode import load_rows
+
         cut = len(hit.ids) if hit is not None else 0
-        self.cache = [c for c in self.cache if len(c.ids) <= cut]
+        self._take_over(list(hit.ids) if hit is not None else [])
+        if hit is not None and hit.rows is not None:
+            load_rows(self.e, hit)
+            hit.rows, hit.nbytes = None, 0            # live again
+        self.live = list(prompt)
         first = prefill(self.e, prompt, sampling, mtp=use_mtp, drafter=drafter, resume=hit)
         prefill_s = time.perf_counter() - t0
         if draft:
@@ -356,6 +398,7 @@ class GlmEngine:
         else:
             res = mtp_decode(self.e, first, max_tokens, sampling, policy=policy, stop_eos=stop_eos,
                              on_tokens=on_tokens)
+        self.live = list(prompt) + res.tokens[:self.e.st.pos - len(prompt)]
         if draft and policy is not None and res.keeps:
             committed = list(prompt) + res.tokens[:self.e.st.pos - len(prompt)]
             if auto:
@@ -364,7 +407,7 @@ class GlmEngine:
                 pending = None if use_dflash else self.e.main_hidden(slice(0, res.keeps[-1]))
             self._remember(take_snapshot(self.e, committed, pending, mtp=use_mtp, drafter=drafter))
         elif policy is None:
-            self.cache = [c for c in self.cache if len(c.ids) <= len(prompt)]   # the reply's rows are not kept
+            pass                                      # serial replies keep no snapshot of their own
         stats.update(decode_s=res.seconds, rounds=res.rounds, min_rows=1 + min(res.depths, default=0),
                      tokens_per_round=round((len(res.tokens) - 1) / max(res.rounds, 1), 3),
                      sha256=hashlib.sha256(json.dumps(res.tokens).encode()).hexdigest()[:16])

@@ -16,7 +16,7 @@ if not torch.cuda.is_available():
 
 from tensorfold.engine.exact_sampling import Sampling  # noqa: E402
 
-from test_glm_engine import _checkpoint, _generate, _TwoCopies  # noqa: E402  (pytest puts tests/cuda on sys.path)
+from test_glm_engine import _checkpoint, _forget, _generate, _TwoCopies  # noqa: E402  (pytest puts tests/cuda on sys.path)
 
 PROMPT = 2100              # past the dense limit: the first reply token is already a sparse row
 CONTEXT = 2600
@@ -82,6 +82,26 @@ def test_long_prompt_resumes_like_a_fresh_prefill(engine_long):
     follow = first + reply + _prompt(seed=14, n=40)
     warm, stats = _generate(engine_long, follow, sampling, tokens=16)
     assert stats["cached"] >= len(first) + len(reply) - 1
-    _generate(engine_long, _prompt(seed=15, n=12), sampling, tokens=4)   # a fresh prefill: kept states go
+    _forget(engine_long)                                # every kept state goes: the next prefill is fresh
     cold, stats = _generate(engine_long, follow, sampling, tokens=16)
     assert stats["cached"] == 0 and warm == cold
+
+
+@pytest.mark.parametrize("n", [300, 2080], ids=["short", "long"])
+def test_switching_conversations_resumes_each_like_a_fresh_prefill(engine_long, n):
+    """Conversation A, then B (which takes the live caches), then A again: A resumes from its saved rows and
+    replies exactly as a fresh prefill of the same prompt does; then B resumes too."""
+    sampling = Sampling(31, 1.0, 20, 0.95)
+    a = _prompt(seed=40, n=n)
+    b = _prompt(seed=41, n=n + 17)
+    reply_a, _ = _generate(engine_long, a, sampling, tokens=12)
+    reply_b, _ = _generate(engine_long, b, sampling, tokens=12)
+    next_a = a + reply_a + _prompt(seed=42, n=9)
+    warm_a, stats = _generate(engine_long, next_a, sampling, tokens=12)
+    assert stats["cached"] >= len(a) + len(reply_a) - 1, stats          # resumed from A's saved rows
+    next_b = b + reply_b + _prompt(seed=43, n=9)
+    warm_b, stats = _generate(engine_long, next_b, sampling, tokens=12)
+    assert stats["cached"] >= len(b) + len(reply_b) - 1, stats
+    serial_a, _ = _generate(engine_long, next_a, sampling, draft=False, tokens=12)   # fresh prefill, no cache
+    serial_b, _ = _generate(engine_long, next_b, sampling, draft=False, tokens=12)
+    assert warm_a == serial_a and warm_b == serial_b

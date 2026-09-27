@@ -243,6 +243,13 @@ def engine_x(tmp_path_factory):
     return GlmEngine(path / "model", rank=0, master="", port=0, drafter=path / "dflash2", comm=_TwoCopies())
 
 
+def _forget(engine) -> None:
+    """Drop every kept snapshot, so the next request prefills from scratch (the engine keeps several
+    conversations, so an unrelated prompt no longer does this)."""
+    engine.cache.clear()
+    engine.live = []
+
+
 def _generate(engine, prompt, sampling, *, draft=True, policy=None, tokens=24):
     out: list[int] = []
     engine.request.policy = policy
@@ -285,14 +292,13 @@ def test_drafter_choice_resumes(engine_f):
     sampling = Sampling(11, 1.0, 20, 0.95)
     rng = np.random.default_rng(12)
     first = list(rng.integers(0, 1000, size=30))
-    unrelated = list(rng.integers(0, 1000, size=9))
     reply, stats = _generate(engine_f, first, sampling, policy="auto:1:1:0", tokens=30)
     assert set(stats["drafters"]) == {"m", "f"}
     after = first + reply + [21, 22]
     for policy in ("auto:1:1:0", "auto", "2", "f3"):
         warm, stats = _generate(engine_f, after, sampling, policy=policy)
         assert stats["cached"] >= len(first) + len(reply) - 1, policy
-        _generate(engine_f, unrelated, sampling)
+        _forget(engine_f)
         cold, stats = _generate(engine_f, after, sampling, policy=policy)
         assert stats["cached"] == 0 and warm == cold, policy
         _generate(engine_f, first, sampling, policy="auto:1:1:0", tokens=30)      # the state after the reply again
@@ -302,19 +308,18 @@ def test_drafter_choice_resumes(engine_f):
 def test_resumed_prompts_equal_fresh_prefills(engine, sampling):
     rng = np.random.default_rng(9)
     first = list(rng.integers(0, 1000, size=70))       # more than one 64-row prefill chunk
-    unrelated = list(rng.integers(0, 1000, size=12))
     reply, _ = _generate(engine, first, sampling)
     after_reply = first + reply + [5, 6, 7]
     warm, stats = _generate(engine, after_reply, sampling)
     assert stats["cached"] >= len(first) + len(reply) - 1
-    _generate(engine, unrelated, sampling)              # a fresh prefill: every kept state goes
+    _forget(engine)                                     # every kept state goes: the next prefill is fresh
     cold, stats = _generate(engine, after_reply, sampling)
     assert stats["cached"] == 0 and warm == cold
     _generate(engine, first, sampling)
     after_prompt = first + [11, 12, 13]
     warm, stats = _generate(engine, after_prompt, sampling, policy="2")
     assert stats["cached"] == len(first)
-    _generate(engine, unrelated, sampling)
+    _forget(engine)
     cold, stats = _generate(engine, after_prompt, sampling, policy="2")
     assert stats["cached"] == 0 and warm == cold
     serial, _ = _generate(engine, after_prompt, sampling, draft=False)
@@ -342,12 +347,11 @@ def test_exl3_checkpoint_resumes(engine_x):
     sampling = Sampling(21, 1.0, 20, 0.95)
     rng = np.random.default_rng(22)
     first = list(rng.integers(0, 1000, size=70))
-    unrelated = list(rng.integers(0, 1000, size=9))
     reply, _ = _generate(engine_x, first, sampling, policy="auto:1:1:0", tokens=20)
     after = first + reply + [31, 32]
     warm, stats = _generate(engine_x, after, sampling)
     assert stats["cached"] >= len(first) + len(reply) - 1
-    _generate(engine_x, unrelated, sampling)
+    _forget(engine_x)
     cold, stats = _generate(engine_x, after, sampling)
     assert stats["cached"] == 0 and warm == cold
 

@@ -233,6 +233,8 @@ class Snapshot:
     pending: torch.Tensor | None
     mtp_len: int
     drafter_end: int
+    rows: list | None = None      # the attention rows of ids, saved when another conversation took the live caches
+    nbytes: int = 0
 
 
 def take_snapshot(e: Engine, ids: Sequence[int], pending: torch.Tensor | None, *, mtp: bool,
@@ -242,6 +244,39 @@ def take_snapshot(e: Engine, ids: Sequence[int], pending: torch.Tensor | None, *
     return Snapshot(list(ids), rec, st.conv.clone(), pending.clone() if pending is not None else None,
                     st.mtp_len - st.mtp_drafted if mtp and pending is not None else -1,
                     drafter.context_end if drafter is not None else -1)
+
+
+def _row_views(st, n: int, m: int) -> list[torch.Tensor]:
+    """Views of every attention cache row a snapshot of n committed tokens (m in the MTP head's caches) depends on:
+    the model's key/latent (and value) rows, the indexer's keys, gates and complete pools, and the MTP head's."""
+    views = [kc[:n] for kc in st.kc] + [vc[:n] for vc in st.vc if vc is not None]
+    idx = st.index or []
+    main_idx = idx[:len(st.kc)]
+    for ik, ig, pk in main_idx:
+        views += [ik[:n], ig[:n], pk[:n // 4 + 1]]
+    if m > 0 and hasattr(st, "mtp_kc"):
+        views.append(st.mtp_kc[:m])
+        if getattr(st, "mtp_vc", None) is not None:
+            views.append(st.mtp_vc[:m])
+        if len(idx) > len(st.kc):
+            ik, ig, pk = idx[-1]
+            views += [ik[:m], ig[:m], pk[:m // 4 + 1]]
+    return views
+
+
+def save_rows(e: Engine, snap: Snapshot) -> None:
+    """Copy the snapshot's attention rows out of the live caches (they are about to be overwritten by another
+    conversation). The DFlash2 drafter's caches are not saved, so the snapshot no longer serves DFlash2 drafts."""
+    views = _row_views(e.st, len(snap.ids), max(snap.mtp_len, 0))
+    snap.rows = [v.clone() for v in views]
+    snap.nbytes = sum(r.numel() * r.element_size() for r in snap.rows)
+    snap.drafter_end = -1
+
+
+def load_rows(e: Engine, snap: Snapshot) -> None:
+    """Put a saved snapshot's attention rows back into the live caches."""
+    for dst, src in zip(_row_views(e.st, len(snap.ids), max(snap.mtp_len, 0)), snap.rows):
+        dst.copy_(src)
 
 
 def restore(e: Engine, snap: Snapshot, drafter=None) -> None:
