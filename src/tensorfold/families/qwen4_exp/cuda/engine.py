@@ -19,6 +19,7 @@ so the two ranks stay in step.
 from __future__ import annotations
 
 import json
+import os
 import time
 from datetime import timedelta
 from pathlib import Path
@@ -64,7 +65,11 @@ class FlashNextEngine:
             raise ValueError("this checkpoint has no MTP head, which Flash Next's CUDA engine drafts with: use one "
                              "that has it, or --no-drafts for the serial reference (one token a round)")
         self.w = w
-        self.e = Engine(w, capacity=self.max_len, max_rows=max(8, self.depth + 1), graphs=graphs)
+        # Prefill chunk rows (engine/ branch): TensorFold 0.3.4 used 64. Long chunks share each MoE expert's weight
+        # reads among many rows; a row's bits do not depend on its chunk.
+        self.prefill_rows = int(os.environ.get("TF_QWEN4_PREFILL_ROWS", "64"))
+        self.e = Engine(w, capacity=self.max_len, max_rows=max(8, self.depth + 1), prefill_rows=self.prefill_rows,
+                        graphs=graphs)
         started = time.perf_counter()
         if prefetch:                                  # the n-gram tables' pages, read now rather than by requests
             for layer in w.layers:
@@ -86,14 +91,15 @@ class FlashNextEngine:
         step: refuse to start otherwise."""
 
         total = int(ids.sum()) if ids is not None else -1
+        rows = int(os.environ.get("TF_QWEN4_PREFILL_ROWS", "64"))
         mine = torch.tensor([self.depth, round(self.confidence * 1e6), self.max_len,
-                             len(ids) if ids is not None else -1, total], dtype=torch.int64, device="cuda")
+                             len(ids) if ids is not None else -1, total, rows], dtype=torch.int64, device="cuda")
         both = torch.empty((2 * mine.numel(),), dtype=torch.int64, device="cuda")
         self.comm.all_gather(mine, both)
         both = both.view(2, -1).cpu()
         if not torch.equal(both[0], both[1]):
             raise RuntimeError(f"the two ranks were started with different settings (drafts, confidence, context, "
-                               f"draft vocabulary): rank 0 {both[0].tolist()}, rank 1 {both[1].tolist()}")
+                               f"draft vocabulary, prefill rows): rank 0 {both[0].tolist()}, rank 1 {both[1].tolist()}")
 
     # -- two ranks: rank 0 hands each request to rank 1 ------------------------------------------------------
     def _key(self, n: int) -> str:

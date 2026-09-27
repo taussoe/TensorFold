@@ -466,25 +466,41 @@ def make_experts(gate: tuple, up: tuple, down: tuple, shared: tuple | None = Non
 
 
 @triton.jit
-def _moe_gateup(X, XS, GW, GS, GB, UW, US, UB, UIDS, UCOUNT, UMEM, ACT, AXS,
+def _moe_gateup(X, XS, GW, GS, GB, UW, US, UB, UIDS, UCOUNT, UMEM, ACT, AXS, SKIP, TU, TT,
                 K: tl.constexpr, N: tl.constexpr, MAXM: tl.constexpr, SLOTS: tl.constexpr,
-                BM: tl.constexpr, BLOCK_N: tl.constexpr, GPI: tl.constexpr, SBN: tl.constexpr):
+                BM: tl.constexpr, BLOCK_N: tl.constexpr, GPI: tl.constexpr, SBN: tl.constexpr, MT: tl.constexpr,
+                LAST: tl.constexpr, LIST: tl.constexpr):
     """Program (u, column tile, member tile): the members of distinct expert u (codes row * 32 + slot) times
     its gate and up rows -> bf16(silu(bf16(gate)) * bf16(up)) at ACT[row, slot], with the 32-input group
-    sums of those bf16 values (for the down projection) at AXS[row, slot]."""
+    sums of those bf16 values (for the down projection) at AXS[row, slot]. MT member tiles a program (engine/
+    branch): the expert's weights are read once for them, each tile the same BM-row dot, so MT never changes bits."""
 
     KG: tl.constexpr = K // 32
-    u = tl.program_id(0)
     pid_n = tl.program_id(1)
     mt = tl.program_id(2)
-    if u >= tl.load(UCOUNT):
-        return
+    if LIST:                             # a work list of the (expert, tile) pairs that have rows
+        u = tl.load(TU + tl.program_id(0))
+        mt = tl.load(TT + tl.program_id(0))
+    elif LAST:                           # only the last distinct expert: the shared one (the highest id)
+        u = tl.load(UCOUNT) - 1
+    else:
+        u = tl.program_id(0)
+        if u >= tl.load(UCOUNT):
+            return
     e = tl.load(UIDS + u).to(tl.int64)
-    slot_i = mt * BM + tl.arange(0, BM)
+    if e == SKIP:
+        return
+    slot_i = (mt * MT) * BM + tl.arange(0, BM)
     code = tl.load(UMEM + u * MAXM + slot_i, mask=slot_i < MAXM, other=-1)
     live = code >= 0
     row = tl.where(live, code // 32, 0)
     slot = tl.where(live, code % 32, 0)
+    if MT == 2:
+        slot_i1 = (mt * MT + 1) * BM + tl.arange(0, BM)
+        code1 = tl.load(UMEM + u * MAXM + slot_i1, mask=slot_i1 < MAXM, other=-1)
+        live1 = code1 >= 0
+        row1 = tl.where(live1, code1 // 32, 0)
+        slot1 = tl.where(live1, code1 % 32, 0)
     rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
     rk = tl.arange(0, 32)
     rw = tl.arange(0, 4)
@@ -497,6 +513,9 @@ def _moe_gateup(X, XS, GW, GS, GB, UW, US, UB, UIDS, UCOUNT, UMEM, ACT, AXS,
     gsb = e * KG * N
     acc_g = tl.zeros((BM, BLOCK_N), dtype=tl.float32)
     acc_u = tl.zeros((BM, BLOCK_N), dtype=tl.float32)
+    if MT == 2:
+        acc_g1 = tl.zeros((BM, BLOCK_N), dtype=tl.float32)
+        acc_u1 = tl.zeros((BM, BLOCK_N), dtype=tl.float32)
     for i in range(KG // GPI):
         for j in tl.static_range(GPI):
             g = i * GPI + j
@@ -514,6 +533,19 @@ def _moe_gateup(X, XS, GW, GS, GB, UW, US, UB, UIDS, UCOUNT, UMEM, ACT, AXS,
             su = tl.load(US + gsb + g * N + rn).to(tl.float32)
             bu = tl.load(UB + gsb + g * N + rn).to(tl.float32)
             acc_u = acc_u + pu * su[None, :] + xs[:, None] * bu[None, :]
+            if MT == 2:
+                x1 = tl.load(X + row1[:, None] * K + (g * 32 + rk)[None, :], mask=live1[:, None], other=0.0)
+                xs1 = tl.load(XS + row1 * KG + g, mask=live1, other=0.0)
+                acc_g1 = acc_g1 + tl.dot(x1, tl.trans(qg)) * sg[None, :] + xs1[:, None] * bg[None, :]
+                acc_u1 = acc_u1 + tl.dot(x1, tl.trans(qu)) * su[None, :] + xs1[:, None] * bu[None, :]
+    _gateup_out(ACT, AXS, acc_g, acc_u, row, slot, live, rn, pid_n, N, SLOTS, BM, BLOCK_N)
+    if MT == 2:
+        _gateup_out(ACT, AXS, acc_g1, acc_u1, row1, slot1, live1, rn, pid_n, N, SLOTS, BM, BLOCK_N)
+
+
+@triton.jit
+def _gateup_out(ACT, AXS, acc_g, acc_u, row, slot, live, rn, pid_n, N: tl.constexpr, SLOTS: tl.constexpr,
+                BM: tl.constexpr, BLOCK_N: tl.constexpr):
     gv = acc_g.to(tl.bfloat16).to(tl.float32)
     uv = acc_u.to(tl.bfloat16).to(tl.float32)
     act = ((gv / (1.0 + tl.exp(-gv))).to(tl.bfloat16).to(tl.float32) * uv).to(tl.bfloat16)
@@ -527,23 +559,37 @@ def _moe_gateup(X, XS, GW, GS, GB, UW, US, UB, UIDS, UCOUNT, UMEM, ACT, AXS,
 
 
 @triton.jit
-def _moe_down(ACT, AXS, DW, DS, DB, UIDS, UCOUNT, UMEM, Y,
+def _moe_down(ACT, AXS, DW, DS, DB, UIDS, UCOUNT, UMEM, Y, SKIP, TU, TT,
               NI: tl.constexpr, D: tl.constexpr, MAXM: tl.constexpr, SLOTS: tl.constexpr,
-              BM: tl.constexpr, BLOCK_N: tl.constexpr, GPI: tl.constexpr, SBN: tl.constexpr):
+              BM: tl.constexpr, BLOCK_N: tl.constexpr, GPI: tl.constexpr, SBN: tl.constexpr, MT: tl.constexpr,
+              LAST: tl.constexpr, LIST: tl.constexpr):
     """Program (u, column tile, member tile): Y[row, slot, :] (fp32) = down_e @ ACT[row, slot] for the members
     of distinct expert u."""
 
     KG: tl.constexpr = NI // 32
-    u = tl.program_id(0)
     pid_n = tl.program_id(1)
     mt = tl.program_id(2)
-    if u >= tl.load(UCOUNT):
-        return
+    if LIST:                             # a work list of the (expert, tile) pairs that have rows
+        u = tl.load(TU + tl.program_id(0))
+        mt = tl.load(TT + tl.program_id(0))
+    elif LAST:                           # only the last distinct expert: the shared one (the highest id)
+        u = tl.load(UCOUNT) - 1
+    else:
+        u = tl.program_id(0)
+        if u >= tl.load(UCOUNT):
+            return
     e = tl.load(UIDS + u).to(tl.int64)
-    slot_i = mt * BM + tl.arange(0, BM)
+    if e == SKIP:
+        return
+    slot_i = (mt * MT) * BM + tl.arange(0, BM)
     code = tl.load(UMEM + u * MAXM + slot_i, mask=slot_i < MAXM, other=-1)
     live = code >= 0
     src = tl.where(live, (code // 32) * SLOTS + code % 32, 0)
+    if MT == 2:
+        slot_i1 = (mt * MT + 1) * BM + tl.arange(0, BM)
+        code1 = tl.load(UMEM + u * MAXM + slot_i1, mask=slot_i1 < MAXM, other=-1)
+        live1 = code1 >= 0
+        src1 = tl.where(live1, (code1 // 32) * SLOTS + code1 % 32, 0)
     rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
     rk = tl.arange(0, 32)
     rw = tl.arange(0, 4)
@@ -554,6 +600,8 @@ def _moe_down(ACT, AXS, DW, DS, DB, UIDS, UCOUNT, UMEM, Y,
     tile = DW + (e * NT + pid_n // SUB) * (KG * SBN * 4)
     sb = e * KG * D
     acc = tl.zeros((BM, BLOCK_N), dtype=tl.float32)
+    if MT == 2:
+        acc1 = tl.zeros((BM, BLOCK_N), dtype=tl.float32)
     for i in range(KG // GPI):
         for j in tl.static_range(GPI):
             g = i * GPI + j
@@ -565,32 +613,82 @@ def _moe_down(ACT, AXS, DW, DS, DB, UIDS, UCOUNT, UMEM, Y,
             s = tl.load(DS + sb + g * D + rn).to(tl.float32)
             b = tl.load(DB + sb + g * D + rn).to(tl.float32)
             acc = acc + p * s[None, :] + xs[:, None] * b[None, :]
+            if MT == 2:
+                x1 = tl.load(ACT + src1[:, None] * NI + (g * 32 + rk)[None, :], mask=live1[:, None], other=0.0)
+                xs1 = tl.load(AXS + src1 * KG + g, mask=live1, other=0.0)
+                acc1 = acc1 + tl.dot(x1, tl.trans(q)) * s[None, :] + xs1[:, None] * b[None, :]
     tl.store(Y + src[:, None] * D + rn[None, :], acc, mask=live[:, None])
+    if MT == 2:
+        tl.store(Y + src1[:, None] * D + rn[None, :], acc1, mask=live1[:, None])
 
 
 def moe_gateup(x: torch.Tensor, xs: torch.Tensor, ex: Experts, group: "Group", act: torch.Tensor,
                axs: torch.Tensor, *, bm: int = 16, gpi: int = 4, num_warps: int = 4, num_stages: int | None = None,
-               block_n: int | None = None) -> None:
+               block_n: int | None = None, mt: int | None = None, tiles: int | None = None, skip: int = -1,
+               last: bool = False, work: tuple | None = None) -> None:
+    """``tiles``: member tiles per expert (default: enough for every row); ``skip``: an expert id left out;
+    ``last``: run only the last distinct expert (the shared one). None of them changes a (row, expert) pair's bits:
+    prefill chunks run the routed experts on a grid sized for the busiest one and the shared expert on its own."""
     maxm = group.members.shape[1]
+    mt = mt or (2 if maxm > 128 else 1)          # prefill chunks: an expert's weights read once for two tiles
     small = maxm <= 2                    # tuned on GB10: 32-wide programs, 2 stages at 1-2 rows; 64-wide, 3 above
     block_n = block_n or (32 if small else BN)
     num_stages = num_stages or (2 if small else 3)
-    grid = (group.ids.shape[0], ex.width // block_n, triton.cdiv(maxm, bm))
+    tu, tt = work if work is not None else (group.ids, group.ids)
+    if work is not None:
+        grid = (tu.shape[0], ex.width // block_n, 1)
+    else:
+        grid = (1 if last else group.ids.shape[0], ex.width // block_n, triton.cdiv(tiles or triton.cdiv(maxm, bm), mt))
     _moe_gateup[grid](x, xs, ex.gw, ex.gs, ex.gb, ex.uw, ex.us, ex.ub, group.ids, group.count, group.members,
-                      act, axs, K=ex.dims, N=ex.width, MAXM=maxm, SLOTS=act.shape[1], BM=bm, BLOCK_N=block_n,
+                      act, axs, skip, tu, tt, MT=mt, LAST=last, LIST=work is not None, K=ex.dims, N=ex.width, MAXM=maxm, SLOTS=act.shape[1], BM=bm, BLOCK_N=block_n,
                       GPI=gpi_for(ex.dims // GS, gpi), SBN=BN, num_warps=num_warps, num_stages=num_stages)
 
 
 def moe_down(act: torch.Tensor, axs: torch.Tensor, ex: Experts, group: "Group", y: torch.Tensor, *, bm: int = 16,
-             gpi: int | None = None, num_warps: int = 4, num_stages: int = 2, block_n: int | None = None) -> None:
+             gpi: int | None = None, num_warps: int = 4, num_stages: int = 2, block_n: int | None = None,
+             mt: int | None = None, tiles: int | None = None, skip: int = -1, last: bool = False,
+             work: tuple | None = None) -> None:
     maxm = group.members.shape[1]
+    mt = mt or (2 if maxm > 128 else 1)
     small = maxm <= 2
     block_n = block_n or (32 if small else BN)
     gpi = gpi or (2 if small else 1)
-    grid = (group.ids.shape[0], ex.dims // block_n, triton.cdiv(maxm, bm))
-    _moe_down[grid](act, axs, ex.dw, ex.ds, ex.db, group.ids, group.count, group.members, y,
+    tu, tt = work if work is not None else (group.ids, group.ids)
+    if work is not None:
+        grid = (tu.shape[0], ex.dims // block_n, 1)
+    else:
+        grid = (1 if last else group.ids.shape[0], ex.dims // block_n, triton.cdiv(tiles or triton.cdiv(maxm, bm), mt))
+    _moe_down[grid](act, axs, ex.dw, ex.ds, ex.db, group.ids, group.count, group.members, y, skip, tu, tt, MT=mt,
+                    LAST=last, LIST=work is not None,
                     NI=ex.width, D=ex.dims, MAXM=maxm, SLOTS=act.shape[1], BM=bm, BLOCK_N=block_n,
                     GPI=gpi_for(ex.width // GS, gpi), SBN=BN, num_warps=num_warps, num_stages=num_stages)
+
+
+def moe_work(group: "Group", rows_per_program: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """The (distinct expert, tile) pairs that have rows, as two int32 lists: one program each. Routing is skewed,
+    so a grid sized for the busiest expert would launch that many tiles for all ~513 experts. One host read."""
+    counts = (group.members >= 0).sum(1)                                  # 0 past the used experts
+    n = (counts + rows_per_program - 1) // rows_per_program
+    total = int(n.sum())
+    tu = torch.repeat_interleave(torch.arange(n.shape[0], device=n.device, dtype=torch.int32), n, output_size=total)
+    starts = torch.repeat_interleave(torch.cumsum(n, 0) - n, n, output_size=total)
+    tt = (torch.arange(total, device=n.device) - starts).to(torch.int32)
+    return tu, tt
+
+
+def moe_experts(x: torch.Tensor, xs: torch.Tensor, ex: Experts, group: "Group", act: torch.Tensor,
+                axs: torch.Tensor, y: torch.Tensor, *, bm: int = 16) -> None:
+    """Gate/up then down for a window's rows. Prefill chunks (more than 128 rows) launch one program per (expert,
+    tile) pair that has rows (``moe_work``), two tiles of ``bm`` rows each sharing the expert's weight reads;
+    decode windows keep one static launch each. A (row, expert) pair's bits are the same either way."""
+    rows = group.members.shape[1]
+    if rows <= 128:
+        moe_gateup(x, xs, ex, group, act, axs, bm=bm)
+        moe_down(act, axs, ex, group, y, bm=bm)
+        return
+    work = moe_work(group, 2 * bm)
+    moe_gateup(x, xs, ex, group, act, axs, bm=bm, mt=2, work=work)
+    moe_down(act, axs, ex, group, y, bm=bm, mt=2, work=work)
 
 
 @dataclass

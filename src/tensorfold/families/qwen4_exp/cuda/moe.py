@@ -158,6 +158,5 @@ def moe(x: torch.Tensor, xs: torch.Tensor, router_rows: torch.Tensor, ex: Expert
 
     router(x, router_rows, buf.logits)
     select(buf.logits, buf, cfg.num_experts_per_tok, cfg.num_experts)
-    qmm.moe_gateup(x, xs, ex, buf.group, buf.act, buf.axs, bm=bm)
-    qmm.moe_down(buf.act, buf.axs, ex, buf.group, buf.y, bm=bm)
+    qmm.moe_experts(x, xs, ex, buf.group, buf.act, buf.axs, buf.y, bm=bm)
     return buf

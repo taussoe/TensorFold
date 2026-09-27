@@ -21,6 +21,7 @@ import torch
 from tensorfold.engine.exact_sampling import MARGIN, Sampling, choose_rows
 
 from . import CONFIDENCE, DEPTH
+from . import prof
 from .forward import CAND, Buffers, State, commit, forward
 from .mtp import mtp_forward
 from .weights import Weights
@@ -300,6 +301,7 @@ def prefill(e: Engine, prompt: Sequence[int], sampling: Sampling | None, *, mtp:
         if use_mtp and resume.get("tail") is not None:
             absorb(e, resume["tail"], [prompt[begin]])
     last = None
+    prof.active = True
     for start in range(begin, len(prompt), e.rows):
         chunk = list(prompt[start:start + e.rows])
         R = len(chunk)
@@ -309,8 +311,12 @@ def prefill(e: Engine, prompt: Sequence[int], sampling: Sampling | None, *, mtp:
         if use_mtp:
             nxt = list(prompt[start + 1:start + R + 1])
             if nxt:
-                absorb(e, b.streams[:len(nxt)], nxt)
-        commit(w, st, b, R, R)
+                with prof.timed("mtp absorb"):
+                    absorb(e, b.streams[:len(nxt)], nxt)
+        with prof.timed("commit"):
+            commit(w, st, b, R, R)
+    prof.active = False
+    prof.report(len(prompt) - begin)
     first = e.sample(last, [len(prompt)], sampling)[0]
     e.last_streams = streams_last
     e.first = first

@@ -26,6 +26,7 @@ import triton
 import triton.language as tl
 
 from . import attention as attn_mod
+from . import prof
 from . import gdn as gdn_mod
 from . import glue, moe as moe_mod, qmm
 from .weights import HC, LayerW, Weights
@@ -365,10 +366,12 @@ def moe_block(layer: LayerW, w: Weights, b: Buffers, R: int) -> tuple:
     m = layer.moe
     buf = b.moe
     sub = _Sub(buf, R)
-    moe_mod.router(b.mixed[:R], m.router, buf.logits[:R])
-    moe_mod.select(buf.logits[:R], sub, w.cfg.top_k, w.cfg.experts)
-    qmm.moe_gateup(b.mixed[:R], b.xs_mixed[:R], m.experts, sub.group, buf.act, buf.axs)
-    qmm.moe_down(buf.act, buf.axs, m.experts, sub.group, buf.y)
+    with prof.timed("moe: router"):
+        moe_mod.router(b.mixed[:R], m.router, buf.logits[:R])
+    with prof.timed("moe: select + group"):
+        moe_mod.select(buf.logits[:R], sub, w.cfg.top_k, w.cfg.experts)
+    with prof.timed("moe: experts"):
+        qmm.moe_experts(b.mixed[:R], b.xs_mixed[:R], m.experts, sub.group, buf.act, buf.axs, buf.y)
     if w.comm is None:
         return 2, buf.y, sub.wts
     glue.moe_partial(buf.y, sub.wts, b.part_moe, R)
@@ -416,26 +419,32 @@ def layer_forward(layer: LayerW, w: Weights, st: State, b: Buffers, R: int, pend
         if pending is not None:
             _writeback(h, b, R, c, pending)
             pending = None
-        ple_block(layer, w, st, b, R)
-    if pending is None:
-        hc_block(layer.attn_hc, b, R, c.eps, c.streams, c.low, 0, None, b.inj_a, h)
-    else:
-        mode, a, wts, inj = pending
-        if mode == 2:
-            hc_block(layer.attn_hc, b, R, c.eps, c.streams, c.low, 2, inj[:R], b.inj_a, h, y=a, wts=wts)
+        with prof.timed("ple (n-gram)"):
+            ple_block(layer, w, st, b, R)
+    with prof.timed("hc"):
+        if pending is None:
+            hc_block(layer.attn_hc, b, R, c.eps, c.streams, c.low, 0, None, b.inj_a, h)
         else:
-            hc_block(layer.attn_hc, b, R, c.eps, c.streams, c.low, mode, inj[:R], b.inj_a, h, branch=a)
+            mode, a, wts, inj = pending
+            if mode == 2:
+                hc_block(layer.attn_hc, b, R, c.eps, c.streams, c.low, 2, inj[:R], b.inj_a, h, y=a, wts=wts)
+            else:
+                hc_block(layer.attn_hc, b, R, c.eps, c.streams, c.low, mode, inj[:R], b.inj_a, h, branch=a)
     if layer.linear:
-        mode, branch = gdn_block(layer, w, st, b, R)
+        with prof.timed("gdn"):
+            mode, branch = gdn_block(layer, w, st, b, R)
     elif mtp:
         mode, branch = attn_block(layer, w, st.mtp_kc, st.mtp_vc, st.mtp_ikc, st.mtp_pooled, st.mtp_pos, b, R,
                                   context)
     else:
         ai = st.att_index[layer.index]
-        mode, branch = attn_block(layer, w, st.kc[ai], st.vc[ai], st.ikc[ai], st.pooled[ai], st.pos_dev, b, R,
-                                  context)
-    hc_block(layer.mlp_hc, b, R, c.eps, c.streams, c.low, mode, b.inj_a[:R], b.inj_m, h, branch=branch)
-    moe_mode, a, wts = moe_block(layer, w, b, R)
+        with prof.timed("attention"):
+            mode, branch = attn_block(layer, w, st.kc[ai], st.vc[ai], st.ikc[ai], st.pooled[ai], st.pos_dev, b,
+                                      R, context)
+    with prof.timed("hc"):
+        hc_block(layer.mlp_hc, b, R, c.eps, c.streams, c.low, mode, b.inj_a[:R], b.inj_m, h, branch=branch)
+    with prof.timed("moe (total)"):
+        moe_mode, a, wts = moe_block(layer, w, b, R)
     return (moe_mode, a, wts, b.inj_m)
 
 
@@ -501,7 +510,8 @@ def compute(w: Weights, st: State, b: Buffers, R: int, *, logits: bool = True, c
     ctx = st.pos + R if context is None else context
     for layer in w.layers:
         pending = layer_forward(layer, w, st, b, R, pending, context=ctx)
-    return finish(w, w.mixer, b, R, pending, logits=logits)
+    with prof.timed("finish (head)"):
+        return finish(w, w.mixer, b, R, pending, logits=logits)
 
 
 @torch.no_grad()
@@ -509,7 +519,8 @@ def forward(w: Weights, st: State, b: Buffers, tokens: Sequence[int], *, logits:
     """Rows for ``tokens`` at positions st.pos .. st.pos + R - 1: logits [R, V] bf16 (a view of b.logits) and
     the residual streams b.streams[:R]. The committed state is unchanged until ``commit``."""
 
-    R = stage(w, st, b, tokens)
+    with prof.timed("stage (host n-gram rows)"):
+        R = stage(w, st, b, tokens)
     return compute(w, st, b, R, logits=logits)
 
 
