@@ -98,11 +98,12 @@ class Buffers:
         self.ey = torch.empty((rows, slots, D), dtype=f32, device=dev)
         self._groups: dict[int, qmm.Group] = {}
         self.exl3 = None
+        sl = c.shared_width // w.world
         if c.quant == "exl3":            # EXL3 routed experts, and the shared expert as a BF16 MLP
             from .exl3_mm import Scratch
 
-            sl = c.shared_width // w.world
             self.exl3 = Scratch(rows, slots, D, ml, dev)
+        if c.quant == "exl3" or any(l.moe is not None and l.moe.shared is not None for l in w.layers):
             self.sgu = torch.empty((rows, 2 * sl), dtype=bf, device=dev)
             self.sact = torch.empty((rows, sl), dtype=bf, device=dev)
             self.sxs = torch.empty((rows, sl // 64), dtype=f32, device=dev)
@@ -361,29 +362,51 @@ def mlp_block(layer: LayerW, w: Weights, b: Buffers, R: int) -> torch.Tensor:
     return out_proj(w, b, b.act[:R], m.down, b.xs_act[:R], R)
 
 
+def _shared_dense(m, c, b: Buffers, R: int) -> None:
+    """The shared expert as a dense MLP over all rows, into its slot (the last) of b.ey."""
+    s = m.shared
+    qmm.matmul(b.normed[:R], s.gu, b.xs[:R], out=b.sgu[:R], part=b.sk)
+    glue.swiglu(b.sgu[:R], b.sact[:R], b.sxs[:R], c.limit)
+    qmm.matmul(b.sact[:R], s.down, b.sxs[:R], out=b.sy[:R], f32=True, part=b.sk)
+    b.ey[:R, c.top_k].copy_(b.sy[:R])
+
+
 def moe_block(layer: LayerW, w: Weights, b: Buffers, R: int) -> torch.Tensor:
     c = w.cfg
     m = layer.moe
     grp = b.group(R)
-    glue.router(b.normed[:R], m.router, b.mlog[:R])
-    glue.select(b.mlog[:R], m.bias, b.pick[:R], b.wts[:R], grp.ids, grp.count, grp.members, c.top_k, c.experts,
-                c.routed_scale, c.norm_topk)
-    if m.shared is not None:
+    with prof.timed("moe: route + group"):
+        glue.router(b.normed[:R], m.router, b.mlog[:R])
+        glue.select(b.mlog[:R], m.bias, b.pick[:R], b.wts[:R], grp.ids, grp.count, grp.members, c.top_k,
+                    c.experts, c.routed_scale, c.norm_topk)
+    if c.quant == "exl3":
         # EXL3: the routed slots through the trellis kernels, the shared expert (last slot) through BF16 matmuls
         from . import exl3_mm
 
         exl3_mm.routed(b.normed[:R], b.pick, grp, m.experts, b.exl3, b.ey.view(-1, c.hidden), R, c.limit)
-        s = m.shared
-        qmm.matmul(b.normed[:R], s.gu, b.xs[:R], out=b.sgu[:R], part=b.sk)
-        glue.swiglu(b.sgu[:R], b.sact[:R], b.sxs[:R], c.limit)
-        qmm.matmul(b.sact[:R], s.down, b.sxs[:R], out=b.sy[:R], f32=True, part=b.sk)
-        b.ey[:R, c.top_k].copy_(b.sy[:R])
+        _shared_dense(m, c, b, R)
         glue.combine(b.ey[:R], b.wts[:R], b.part[:R])
         return gather(w, b, R)
-    qmm.moe_gateup(b.normed[:R], b.xs[:R], m.experts, grp, b.eact, b.eaxs, c.limit)
-    qmm.moe_down(b.eact, b.eaxs, m.experts, grp, b.ey)
-    glue.combine(b.ey[:R], b.wts[:R], b.part[:R])
-    return gather(w, b, R)
+    tiles, mt, skip = None, 1, -1
+    if m.shared is not None:
+        # 4-bit experts with the shared expert as a dense MLP (TF_GLM_SHARED_DENSE): the grouped kernels skip it
+        # (id c.experts), launch only the member tiles the busiest routed expert needs, and in prefill chunks read
+        # an expert's weights once for two tiles. None of that changes a (row, expert) pair's bits.
+        with prof.timed("moe: shared"):
+            _shared_dense(m, c, b, R)
+        skip = c.experts
+        if R > 128:                          # prefill chunk, eager: one host read of the busiest routed expert
+            used = torch.where(grp.ids == c.experts, 0, (grp.members >= 0).sum(1))
+            tiles, mt = max(1, -(-int(used.max()) // qmm.member_tile(R, 16))), 2
+    with prof.timed("moe: gate/up"):
+        qmm.moe_gateup(b.normed[:R], b.xs[:R], m.experts, grp, b.eact, b.eaxs, c.limit, tiles=tiles, skip=skip,
+                       mt=mt)
+    with prof.timed("moe: down"):
+        qmm.moe_down(b.eact, b.eaxs, m.experts, grp, b.ey, tiles=tiles, skip=skip, mt=mt)
+    with prof.timed("moe: combine"):
+        glue.combine(b.ey[:R], b.wts[:R], b.part[:R])
+    with prof.timed("moe: all-gather"):
+        return gather(w, b, R)
 
 
 def layer_forward(layer: LayerW, w: Weights, st: State, b: Buffers, R: int, nch: int | None = None,
@@ -406,7 +429,7 @@ def layer_forward(layer: LayerW, w: Weights, st: State, b: Buffers, R: int, nch:
         h = layer.ffn_hc
         glue.hc_pre(x, h.fn, h.base, h.scale, layer.post_norm, b.normed[:R], b.xs[:R], b.post[:R], b.comb[:R],
                     b.hcpart[:R], c.eps, c.hc_eps, c.hc_iters)
-    with prof.timed("moe" if layer.mlp is None else "mlp"):
+    with prof.timed("moe (total)" if layer.mlp is None else "mlp"):
         g = mlp_block(layer, w, b, R) if layer.mlp is not None else moe_block(layer, w, b, R)
     glue.hc_post(x, x, g, b.post[:R], b.comb[:R])
 

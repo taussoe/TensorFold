@@ -27,7 +27,12 @@ from typing import Any
 import torch
 
 from .exl3_mm import Exl3Experts, words as exl3_words
+import os
+
 from . import latent
+
+# TF_GLM_SHARED_DENSE=0: the shared expert through the grouped expert kernels (TensorFold 0.3.4). Both ranks must agree.
+SHARED_DENSE = os.environ.get("TF_GLM_SHARED_DENSE", "1") != "0"
 from .qmm import B16, Experts, Q4, as_i32, make_b16, make_experts, make_q4, quantize4, stack_b16, stack_q4
 
 PREFIX = "model.language_model."
@@ -183,7 +188,7 @@ class MoEW:
     router: torch.Tensor      # [E, D] bf16
     bias: torch.Tensor        # [E] fp32
     experts: Experts | Exl3Experts        # 4-bit: E + 1 (shared expert last); EXL3: the E routed experts
-    shared: MLPW | None = None            # EXL3 checkpoints: the shared expert (BF16)
+    shared: MLPW | None = None            # the shared expert as a dense MLP (EXL3: BF16; 4-bit: TF_GLM_SHARED_DENSE)
 
 
 @dataclass
@@ -364,9 +369,16 @@ def load(model_dir: str | Path, *, rank: int, device: str = "cuda") -> Weights:
             ss.append(rd.get(PREFIX + p + f"shared_experts.{proj}.scales"))
             bs.append(rd.get(PREFIX + p + f"shared_experts.{proj}.biases"))
             parts[proj] = (torch.stack(ws).to(dev), torch.stack(ss).to(dev), torch.stack(bs).to(dev))
+        shared = None
+        if SHARED_DENSE:
+            # The shared expert, which every row uses, as a dense 4-bit MLP (engine/ branch): one matmul over all
+            # rows reads its weights once, where the grouped kernels read them once per 32 rows.
+            g, u, d = (parts[x] for x in ("gate_proj", "up_proj", "down_proj"))
+            gu = stack_q4([(g[0][-1], g[1][-1], g[2][-1]), (u[0][-1], u[1][-1], u[2][-1])])
+            shared = MLPW(gu, make_q4(d[0][-1], d[1][-1], d[2][-1]), gu.n // 2)
         ex = make_experts(parts["gate_proj"], parts["up_proj"], parts["down_proj"])
         del parts
-        return MoEW(router, bias, ex)
+        return MoEW(router, bias, ex, shared)
 
     def layer(i: int, plain: bool = False) -> LayerW:
         kind = "dsa" if plain else cfg.kinds[i]

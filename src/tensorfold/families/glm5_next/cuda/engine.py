@@ -143,8 +143,10 @@ class GlmEngine:
         from . import latent
 
         prefill_rows = int(os.environ.get("TF_GLM_PREFILL_ROWS", "64"))
+        from .weights import SHARED_DENSE
+
         mine = [int(drafter is not None), capacity, int(long_context), int(serial_only), int(latent.ENABLED),
-                prefill_rows]
+                prefill_rows, int(SHARED_DENSE)]
         both = self._gather_ints(mine)
         if both[0] != both[1]:
             raise RuntimeError("the two ranks were started with different settings (draft model, context, drafts): "

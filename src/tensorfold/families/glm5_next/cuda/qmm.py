@@ -428,55 +428,23 @@ class Group:
 
 
 @triton.jit
-def _moe_gateup(X, XS, x_stride, GW, GS_, GB, UW, US, UB, UIDS, UCOUNT, UMEM, ACT, AXS, LIMIT,
-                K: tl.constexpr, N: tl.constexpr, MAXM: tl.constexpr, SLOTS: tl.constexpr,
-                BM: tl.constexpr, BLOCK_N: tl.constexpr, GPI: tl.constexpr):
-    """Program (u, column tile, member tile): the members of distinct expert u times its gate and up rows ->
-    ACT[row, slot] = bf16(bf16(silu(min(bf16 g, L))) * clip(bf16 u, -L, L)), and AXS[row, slot, tile] = the
-    fp32 sum of the tile's 64 stored values (one input group of the down projection)."""
-
-    KG: tl.constexpr = K // 64
-    u = tl.program_id(0)
-    pid_n = tl.program_id(1)
-    mt = tl.program_id(2)
-    if u >= tl.load(UCOUNT):
-        return
-    e = tl.load(UIDS + u).to(tl.int64)
-    slot_i = mt * BM + tl.arange(0, BM)
+def _members(UMEM, u, t, MAXM: tl.constexpr, BM: tl.constexpr):
+    slot_i = t * BM + tl.arange(0, BM)
     code = tl.load(UMEM + u * MAXM + slot_i, mask=slot_i < MAXM, other=-1)
-    live = code >= 0
-    if tl.sum(live.to(tl.int32), axis=0) == 0:
-        return
-    row = tl.where(live, code // 32, 0)
-    slot = tl.where(live, code % 32, 0)
-    rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-    rk = tl.arange(0, 64)
-    rw = tl.arange(0, 8)
-    shifts = tl.arange(0, 8) * 4
-    local = tl.arange(0, BLOCK_N)
-    NT: tl.constexpr = N // BLOCK_N
-    gtile = GW + (e * NT + pid_n) * (KG * BLOCK_N * 8)
-    utile = UW + (e * NT + pid_n) * (KG * BLOCK_N * 8)
-    sb = e * KG * N
-    acc_g = tl.zeros((BM, BLOCK_N), dtype=tl.float32)
-    acc_u = tl.zeros((BM, BLOCK_N), dtype=tl.float32)
-    for i in range(KG // GPI):
-        for j in tl.static_range(GPI):
-            g = i * GPI + j
-            x = tl.load(X + row[:, None] * x_stride + (g * 64 + rk)[None, :], mask=live[:, None], other=0.0)
-            xs = tl.load(XS + row * KG + g, mask=live, other=0.0)
-            wg = tl.load(gtile + g * (BLOCK_N * 8) + local[:, None] * 8 + rw[None, :])
-            qg = tl.reshape((wg[:, :, None] >> shifts[None, None, :]) & 0xF, (BLOCK_N, 64)).to(tl.bfloat16)
-            pg = tl.dot(x, tl.trans(qg))
-            sg = tl.load(GS_ + sb + g * N + rn).to(tl.float32)
-            bg = tl.load(GB + sb + g * N + rn).to(tl.float32)
-            acc_g = acc_g + pg * sg[None, :] + xs[:, None] * bg[None, :]
-            wu = tl.load(utile + g * (BLOCK_N * 8) + local[:, None] * 8 + rw[None, :])
-            qu = tl.reshape((wu[:, :, None] >> shifts[None, None, :]) & 0xF, (BLOCK_N, 64)).to(tl.bfloat16)
-            pu = tl.dot(x, tl.trans(qu))
-            su = tl.load(US + sb + g * N + rn).to(tl.float32)
-            bu = tl.load(UB + sb + g * N + rn).to(tl.float32)
-            acc_u = acc_u + pu * su[None, :] + xs[:, None] * bu[None, :]
+    return code, code >= 0
+
+
+@triton.jit
+def _gateup_acc(X, XS, x_stride, row, live, qg, sg, bg, qu, su, bu, acc_g, acc_u, g, rk, KG: tl.constexpr):
+    x = tl.load(X + row[:, None] * x_stride + (g * 64 + rk)[None, :], mask=live[:, None], other=0.0)
+    xs = tl.load(XS + row * KG + g, mask=live, other=0.0)
+    acc_g = acc_g + tl.dot(x, tl.trans(qg)) * sg[None, :] + xs[:, None] * bg[None, :]
+    acc_u = acc_u + tl.dot(x, tl.trans(qu)) * su[None, :] + xs[:, None] * bu[None, :]
+    return acc_g, acc_u
+
+
+@triton.jit
+def _gateup_store(ACT, AXS, acc_g, acc_u, row, slot, live, rn, pid_n, LIMIT, N: tl.constexpr, SLOTS: tl.constexpr):
     gv = tl.minimum(acc_g.to(tl.bfloat16).to(tl.float32), LIMIT)
     uv = tl.minimum(tl.maximum(acc_u.to(tl.bfloat16).to(tl.float32), -LIMIT), LIMIT)
     act = ((gv / (1.0 + tl.exp(-gv))).to(tl.bfloat16).to(tl.float32) * uv).to(tl.bfloat16)
@@ -487,10 +455,84 @@ def _moe_gateup(X, XS, x_stride, GW, GS_, GB, UW, US, UB, UIDS, UCOUNT, UMEM, AC
 
 
 @triton.jit
-def _moe_down(ACT, AXS, DW, DS, DB, UIDS, UCOUNT, UMEM, Y,
+def _moe_gateup(X, XS, x_stride, GW, GS_, GB, UW, US, UB, UIDS, UCOUNT, UMEM, ACT, AXS, LIMIT, SKIP,
+                K: tl.constexpr, N: tl.constexpr, MAXM: tl.constexpr, SLOTS: tl.constexpr,
+                BM: tl.constexpr, BLOCK_N: tl.constexpr, GPI: tl.constexpr, MT: tl.constexpr):
+    """Program (u, column tile, member tile pair): up to MT tiles of BM members of distinct expert u times its gate
+    and up rows -> ACT[row, slot] = bf16(bf16(silu(min(bf16 g, L))) * clip(bf16 u, -L, L)), and AXS[row, slot,
+    tile] = the fp32 sum of the tile's 64 stored values (one input group of the down projection). The expert's
+    weights are read once for the MT tiles; each tile's product is the same BM-row dot as with MT = 1, so a
+    (row, expert) pair's bits do not depend on MT."""
+
+    KG: tl.constexpr = K // 64
+    u = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    mt = tl.program_id(2)
+    if u >= tl.load(UCOUNT):
+        return
+    e = tl.load(UIDS + u).to(tl.int64)
+    if e == SKIP:
+        return
+    code0, live0 = _members(UMEM, u, mt * MT, MAXM, BM)
+    n_live = tl.sum(live0.to(tl.int32), axis=0)
+    if MT == 2:
+        code1, live1 = _members(UMEM, u, mt * MT + 1, MAXM, BM)
+        n_live += tl.sum(live1.to(tl.int32), axis=0)
+    if n_live == 0:
+        return
+    row0 = tl.where(live0, code0 // 32, 0)
+    slot0 = tl.where(live0, code0 % 32, 0)
+    if MT == 2:
+        row1 = tl.where(live1, code1 // 32, 0)
+        slot1 = tl.where(live1, code1 % 32, 0)
+    rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    rk = tl.arange(0, 64)
+    rw = tl.arange(0, 8)
+    shifts = tl.arange(0, 8) * 4
+    local = tl.arange(0, BLOCK_N)
+    NT: tl.constexpr = N // BLOCK_N
+    gtile = GW + (e * NT + pid_n) * (KG * BLOCK_N * 8)
+    utile = UW + (e * NT + pid_n) * (KG * BLOCK_N * 8)
+    sb = e * KG * N
+    acc_g0 = tl.zeros((BM, BLOCK_N), dtype=tl.float32)
+    acc_u0 = tl.zeros((BM, BLOCK_N), dtype=tl.float32)
+    if MT == 2:
+        acc_g1 = tl.zeros((BM, BLOCK_N), dtype=tl.float32)
+        acc_u1 = tl.zeros((BM, BLOCK_N), dtype=tl.float32)
+    for i in range(KG // GPI):
+        for j in tl.static_range(GPI):
+            g = i * GPI + j
+            wg = tl.load(gtile + g * (BLOCK_N * 8) + local[:, None] * 8 + rw[None, :])
+            qg = tl.reshape((wg[:, :, None] >> shifts[None, None, :]) & 0xF, (BLOCK_N, 64)).to(tl.bfloat16)
+            sg = tl.load(GS_ + sb + g * N + rn).to(tl.float32)
+            bg = tl.load(GB + sb + g * N + rn).to(tl.float32)
+            wu = tl.load(utile + g * (BLOCK_N * 8) + local[:, None] * 8 + rw[None, :])
+            qu = tl.reshape((wu[:, :, None] >> shifts[None, None, :]) & 0xF, (BLOCK_N, 64)).to(tl.bfloat16)
+            su = tl.load(US + sb + g * N + rn).to(tl.float32)
+            bu = tl.load(UB + sb + g * N + rn).to(tl.float32)
+            acc_g0, acc_u0 = _gateup_acc(X, XS, x_stride, row0, live0, qg, sg, bg, qu, su, bu, acc_g0, acc_u0,
+                                         g, rk, KG)
+            if MT == 2:
+                acc_g1, acc_u1 = _gateup_acc(X, XS, x_stride, row1, live1, qg, sg, bg, qu, su, bu, acc_g1, acc_u1,
+                                             g, rk, KG)
+    _gateup_store(ACT, AXS, acc_g0, acc_u0, row0, slot0, live0, rn, pid_n, LIMIT, N, SLOTS)
+    if MT == 2:
+        _gateup_store(ACT, AXS, acc_g1, acc_u1, row1, slot1, live1, rn, pid_n, LIMIT, N, SLOTS)
+
+
+@triton.jit
+def _down_acc(ACT, AXS, src, live, q, s, b, acc, g, rk, NI: tl.constexpr, KG: tl.constexpr):
+    x = tl.load(ACT + src[:, None] * NI + (g * 64 + rk)[None, :], mask=live[:, None], other=0.0)
+    xs = tl.load(AXS + src * KG + g, mask=live, other=0.0)
+    return acc + tl.dot(x, tl.trans(q)) * s[None, :] + xs[:, None] * b[None, :]
+
+
+@triton.jit
+def _moe_down(ACT, AXS, DW, DS, DB, UIDS, UCOUNT, UMEM, Y, SKIP,
               NI: tl.constexpr, D: tl.constexpr, MAXM: tl.constexpr, SLOTS: tl.constexpr,
-              BM: tl.constexpr, BLOCK_N: tl.constexpr, GPI: tl.constexpr):
-    """Program (u, column tile, member tile): Y[row, slot, :] (fp32) = down_e @ ACT[row, slot]."""
+              BM: tl.constexpr, BLOCK_N: tl.constexpr, GPI: tl.constexpr, MT: tl.constexpr):
+    """Program (u, column tile, member tile pair): Y[row, slot, :] (fp32) = down_e @ ACT[row, slot] for up to MT
+    tiles of BM members, the expert's weights read once for them (same per-tile dot as MT = 1)."""
 
     KG: tl.constexpr = NI // 64
     u = tl.program_id(0)
@@ -499,12 +541,18 @@ def _moe_down(ACT, AXS, DW, DS, DB, UIDS, UCOUNT, UMEM, Y,
     if u >= tl.load(UCOUNT):
         return
     e = tl.load(UIDS + u).to(tl.int64)
-    slot_i = mt * BM + tl.arange(0, BM)
-    code = tl.load(UMEM + u * MAXM + slot_i, mask=slot_i < MAXM, other=-1)
-    live = code >= 0
-    if tl.sum(live.to(tl.int32), axis=0) == 0:
+    if e == SKIP:
         return
-    src = tl.where(live, (code // 32) * SLOTS + code % 32, 0)
+    code0, live0 = _members(UMEM, u, mt * MT, MAXM, BM)
+    n_live = tl.sum(live0.to(tl.int32), axis=0)
+    if MT == 2:
+        code1, live1 = _members(UMEM, u, mt * MT + 1, MAXM, BM)
+        n_live += tl.sum(live1.to(tl.int32), axis=0)
+    if n_live == 0:
+        return
+    src0 = tl.where(live0, (code0 // 32) * SLOTS + code0 % 32, 0)
+    if MT == 2:
+        src1 = tl.where(live1, (code1 // 32) * SLOTS + code1 % 32, 0)
     rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
     rk = tl.arange(0, 64)
     rw = tl.arange(0, 8)
@@ -513,19 +561,22 @@ def _moe_down(ACT, AXS, DW, DS, DB, UIDS, UCOUNT, UMEM, Y,
     NT: tl.constexpr = D // BLOCK_N
     tile = DW + (e * NT + pid_n) * (KG * BLOCK_N * 8)
     sb = e * KG * D
-    acc = tl.zeros((BM, BLOCK_N), dtype=tl.float32)
+    acc0 = tl.zeros((BM, BLOCK_N), dtype=tl.float32)
+    if MT == 2:
+        acc1 = tl.zeros((BM, BLOCK_N), dtype=tl.float32)
     for i in range(KG // GPI):
         for j in tl.static_range(GPI):
             g = i * GPI + j
-            x = tl.load(ACT + src[:, None] * NI + (g * 64 + rk)[None, :], mask=live[:, None], other=0.0)
-            xs = tl.load(AXS + src * KG + g, mask=live, other=0.0)
             w = tl.load(tile + g * (BLOCK_N * 8) + local[:, None] * 8 + rw[None, :])
             q = tl.reshape((w[:, :, None] >> shifts[None, None, :]) & 0xF, (BLOCK_N, 64)).to(tl.bfloat16)
-            p = tl.dot(x, tl.trans(q))
             s = tl.load(DS + sb + g * D + rn).to(tl.float32)
             b = tl.load(DB + sb + g * D + rn).to(tl.float32)
-            acc = acc + p * s[None, :] + xs[:, None] * b[None, :]
-    tl.store(Y + src[:, None] * D + rn[None, :], acc, mask=live[:, None])
+            acc0 = _down_acc(ACT, AXS, src0, live0, q, s, b, acc0, g, rk, NI, KG)
+            if MT == 2:
+                acc1 = _down_acc(ACT, AXS, src1, live1, q, s, b, acc1, g, rk, NI, KG)
+    tl.store(Y + src0[:, None] * D + rn[None, :], acc0, mask=live0[:, None])
+    if MT == 2:
+        tl.store(Y + src1[:, None] * D + rn[None, :], acc1, mask=live1[:, None])
 
 
 # (member tile, groups per unrolled step, warps, stages) for the grouped expert kernels; none changes bits.
@@ -550,25 +601,28 @@ def member_tile(rows: int, default: int) -> int:
 
 def moe_gateup(x: torch.Tensor, xs: torch.Tensor, ex: Experts, group: Group, act: torch.Tensor,
                axs: torch.Tensor, limit: float, *, bm: int | None = None, gpi: int | None = None,
-               num_warps: int | None = None, num_stages: int | None = None) -> None:
+               num_warps: int | None = None, num_stages: int | None = None, tiles: int | None = None,
+               skip: int = -1, mt: int = 1) -> None:
+    """``tiles``: member tiles launched per expert (default: enough for every row); ``skip``: an expert id left out
+    (the shared expert when it runs as a dense matmul). Neither changes a computed (row, expert) pair's bits."""
     c_bm, c_gpi, c_w, c_s = MOE_CFG["gateup"]
     bm, gpi, num_warps, num_stages = bm or member_tile(x.shape[0], c_bm), gpi or c_gpi, num_warps or c_w, num_stages or c_s
     maxm = group.members.shape[1]
-    grid = (group.ids.shape[0], ex.width // BN, triton.cdiv(maxm, bm))
+    grid = (group.ids.shape[0], ex.width // BN, triton.cdiv(tiles or triton.cdiv(maxm, bm), mt))
     _moe_gateup[grid](x, xs, x.stride(0), ex.gw, ex.gs, ex.gb, ex.uw, ex.us, ex.ub, group.ids, group.count,
-                      group.members, act, axs, float(limit), K=ex.dims, N=ex.width, MAXM=maxm, SLOTS=act.shape[1],
+                      group.members, act, axs, float(limit), skip, MT=mt, K=ex.dims, N=ex.width, MAXM=maxm, SLOTS=act.shape[1],
                       BM=bm, BLOCK_N=BN, GPI=gpi_for(ex.dims // GS, gpi), num_warps=num_warps,
                       num_stages=num_stages)
 
 
 def moe_down(act: torch.Tensor, axs: torch.Tensor, ex: Experts, group: Group, y: torch.Tensor, *,
              bm: int | None = None, gpi: int | None = None, num_warps: int | None = None,
-             num_stages: int | None = None) -> None:
+             num_stages: int | None = None, tiles: int | None = None, skip: int = -1, mt: int = 1) -> None:
     c_bm, c_gpi, c_w, c_s = MOE_CFG["down"]
     bm, gpi, num_warps, num_stages = (bm or member_tile(group.members.shape[1], c_bm), gpi or c_gpi,
                                       num_warps or c_w, num_stages or c_s)
     maxm = group.members.shape[1]
-    grid = (group.ids.shape[0], ex.dims // BN, triton.cdiv(maxm, bm))
-    _moe_down[grid](act, axs, ex.dw, ex.ds, ex.db, group.ids, group.count, group.members, y,
+    grid = (group.ids.shape[0], ex.dims // BN, triton.cdiv(tiles or triton.cdiv(maxm, bm), mt))
+    _moe_down[grid](act, axs, ex.dw, ex.ds, ex.db, group.ids, group.count, group.members, y, skip, MT=mt,
                     NI=ex.width, D=ex.dims, MAXM=maxm, SLOTS=act.shape[1], BM=bm, BLOCK_N=BN,
                     GPI=gpi_for(ex.width // GS, gpi), num_warps=num_warps, num_stages=num_stages)

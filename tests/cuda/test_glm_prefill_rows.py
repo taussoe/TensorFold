@@ -37,14 +37,15 @@ def test_moe_member_tile_does_not_change_bits(R):
                     torch.full((E + 1, R), -1, dtype=torch.int32, device="cuda"))
     glue.select(logits, torch.zeros((E,), device="cuda"), pick, wts, grp.ids, grp.count, grp.members, K, E, 1.0, True)
     outs = {}
-    for bm in (16, 32):
+    for bm, mt in ((16, 1), (32, 1), (32, 2), (16, 2)):
         act = torch.zeros((R, K + 1, NI), dtype=torch.bfloat16, device="cuda")
         axs = torch.zeros((R, K + 1, NI // 64), dtype=torch.float32, device="cuda")
         y = torch.zeros((R, K + 1, D), dtype=torch.float32, device="cuda")
-        qmm.moe_gateup(x, xs, ex, grp, act, axs, 7.0, bm=bm)
-        qmm.moe_down(act, axs, ex, grp, y, bm=bm)
-        outs[bm] = y
-    assert torch.equal(outs[16], outs[32]), "member tile 32 changed bits"
+        qmm.moe_gateup(x, xs, ex, grp, act, axs, 7.0, bm=bm, mt=mt)
+        qmm.moe_down(act, axs, ex, grp, y, bm=bm, mt=mt)
+        outs[(bm, mt)] = y
+    for key in outs:
+        assert torch.equal(outs[(16, 1)], outs[key]), f"member tile {key[0]} x {key[1]} changed bits"
 
 
 @cuda
