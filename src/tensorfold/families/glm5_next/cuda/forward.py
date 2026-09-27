@@ -273,7 +273,8 @@ def kda_block(layer: LayerW, w: Weights, st: State, b: Buffers, R: int) -> torch
 
 
 def dsa_block(layer: LayerW, w: Weights, kc: torch.Tensor, vc: torch.Tensor, pos_dev: torch.Tensor, b: Buffers,
-              R: int, nch: int | None, index=None, host_pos: int | None = None) -> torch.Tensor:
+              R: int, nch: int | None, index=None, host_pos: int | None = None,
+              sparse_np: int | None = None) -> torch.Tensor:
     """``pos_dev``: the committed length on the device; ``nch``: attention chunks to visit (None: the capacity's).
     ``index``: this layer's indexer caches (long contexts): the window's index keys and pools are always written;
     rows past 2050 then attend to their top-512 pools (``host_pos`` given, eager only)."""
@@ -286,7 +287,9 @@ def dsa_block(layer: LayerW, w: Weights, kc: torch.Tensor, vc: torch.Tensor, pos
     HL = a.heads
     qmm.matmul(b.qr[:R], a.q_b, b.xs_qr[:R], out=b.q[:R].view(R, HL * c.qk_dim), part=b.sk)
     if a.absorb is not None:
-        return _dsa_latent(a, w, kc, pos_dev, b, R, nch, index, host_pos)
+        return _dsa_latent(a, w, kc, pos_dev, b, R, nch, index, host_pos, sparse_np)
+    if sparse_np is not None:
+        raise ValueError("sparse CUDA graphs need the latent cache (TF_GLM_LATENT=1)")
     qmm.matmul(b.lat[:R], a.kv_k, b.xs_lat[:R], out=b.kn[:R].view(R, HL * c.qk_dim), part=b.sk)
     qmm.matmul(b.lat[:R], a.kv_v, b.xs_lat[:R], out=b.vn[:R].view(R, HL * c.v_dim), part=b.sk)
     kv_write(b.kn[:R], b.vn[:R], kc, vc, pos_dev)
@@ -311,7 +314,7 @@ def dsa_block(layer: LayerW, w: Weights, kc: torch.Tensor, vc: torch.Tensor, pos
 
 
 def _dsa_latent(a, w: Weights, lc: torch.Tensor, pos_dev: torch.Tensor, b: Buffers, R: int, nch: int | None,
-                index, host_pos: int | None) -> torch.Tensor:
+                index, host_pos: int | None, sparse_np: int | None = None) -> torch.Tensor:
     """``dsa_block`` on the latent cache ``lc`` [capacity, 512] (``latent.py``): the same indexer and token
     selection, attention over latents with the query absorbed into kv_b's key blocks, then kv_b's value blocks."""
 
@@ -320,7 +323,10 @@ def _dsa_latent(a, w: Weights, lc: torch.Tensor, pos_dev: torch.Tensor, b: Buffe
     s = b.lat_s
     with prof.timed("dsa: latent write"):
         latent.latent_write(b.lat[:R], lc, pos_dev)
-    sparse_rows = index is not None and host_pos is not None and host_pos + R - 1 >= c.dense_limit
+    # sparse_np: every row is past the dense limit and ranks sparse_np pools (a captured graph); else decided from
+    # the host position (eager).
+    all_sparse = sparse_np is not None or (host_pos is not None and host_pos >= c.dense_limit)
+    sparse_rows = index is not None and (all_sparse or (host_pos is not None and host_pos + R - 1 >= c.dense_limit))
     if index is not None:
         ik, ig, pk = index
         ix = a.index
@@ -332,7 +338,7 @@ def _dsa_latent(a, w: Weights, lc: torch.Tensor, pos_dev: torch.Tensor, b: Buffe
         qa = latent.absorb_q(b.q[:R], a.absorb, s.qa[:R])
     ol = s.ol[:R]
     scale = c.qk_dim ** -0.5
-    if not (sparse_rows and host_pos >= c.dense_limit):
+    if not all_sparse:
         # Rows past the dense limit are recomputed sparsely below, so the dense pass needs only the chunks up to it.
         with prof.timed("dsa: dense attention"):
             latent.attention(qa, lc, pos_dev, s, scale=scale, nch=min(nch or s.nch, s.nch), out=ol)
@@ -340,7 +346,7 @@ def _dsa_latent(a, w: Weights, lc: torch.Tensor, pos_dev: torch.Tensor, b: Buffe
         with prof.timed("dsa: select tokens"):
             qmm.matmul(b.qr[:R], ix.qb, b.xs_qr[:R], out=b.qi[:R], part=b.sk)
             tokens, counts = sparse.select_tokens(b.qi[:R], b.ikr[:R, c.index_dim:], pk, host_pos, R,
-                                                  pk.shape[0] - 2, pos_dev)
+                                                  pk.shape[0] - 2, pos_dev, bucket=sparse_np)
         with prof.timed("dsa: sparse attention"):
             latent.sparse_attention(qa, lc, tokens, counts, ol, scale)
     with prof.timed("dsa: expand"):
@@ -381,7 +387,7 @@ def moe_block(layer: LayerW, w: Weights, b: Buffers, R: int) -> torch.Tensor:
 
 
 def layer_forward(layer: LayerW, w: Weights, st: State, b: Buffers, R: int, nch: int | None = None,
-                  host_pos: int | None = None) -> None:
+                  host_pos: int | None = None, sparse_np: int | None = None) -> None:
     c = w.cfg
     x = b.x[:R]
     h = layer.attn_hc
@@ -394,7 +400,7 @@ def layer_forward(layer: LayerW, w: Weights, st: State, b: Buffers, R: int, nch:
         di = st.dsa_index[layer.index]
         with prof.timed("dsa (total)"):
             g = dsa_block(layer, w, st.kc[di], st.vc[di], st.pos_dev, b, R, nch,
-                          st.index[di] if st.index is not None else None, host_pos)
+                          st.index[di] if st.index is not None else None, host_pos, sparse_np)
     with prof.timed("hc"):
         glue.hc_post(x, x, g, b.post[:R], b.comb[:R])
         h = layer.ffn_hc
@@ -429,14 +435,14 @@ def stage(w: Weights, st: State, b: Buffers, tokens: Sequence[int]) -> int:
 
 
 def compute(w: Weights, st: State, b: Buffers, R: int, *, logits: bool = True, nch: int | None = None,
-            host_pos: int | None = None):
+            host_pos: int | None = None, sparse_np: int | None = None):
     """The GPU work of a forward on staged rows (capturable: static buffers, device-side positions). ``host_pos``
     (eager calls): the committed length, which long contexts need to switch rows to sparse attention."""
 
     c = w.cfg
     glue.embed(b.ids[:R], w.embed, c.hidden, c.streams, b.x[:R])
     for layer in w.layers:
-        layer_forward(layer, w, st, b, R, nch, host_pos)
+        layer_forward(layer, w, st, b, R, nch, host_pos, sparse_np)
         for slot in b.tap_at.get(layer.index, ()):
             glue.stream_mean(b.x[:R], b.taps[slot][:R])
     glue.stream_mean(b.x[:R], b.hidden[:R])

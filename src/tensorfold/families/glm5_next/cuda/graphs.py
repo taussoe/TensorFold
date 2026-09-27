@@ -1,5 +1,7 @@
 """CUDA graphs for GLM-5.3-Flash decode steps: one per (window rows, KDA state parity) for the model, one per row
-count for the MTP head. A captured step replays the eager kernels with their arguments (static buffers,
+count for the MTP head. With long contexts also one per (rows, parity, pool bucket) for steps past the dense
+limit, where every row attends to its DSA-selected tokens: the pools ranked are fixed per bucket
+(``sparse.pool_bucket``), and positions are read on the device, so the steps capture like the dense ones. A captured step replays the eager kernels with their arguments (static buffers,
 positions read on the device), so its bits equal the eager step's; attention visits every chunk the cache
 can hold (empty chunks are skipped by the merge). Collectives (NCCL on the current stream) are captured too.
 """
@@ -8,8 +10,18 @@ from __future__ import annotations
 
 import torch
 
+from . import latent, prof
 from .forward import compute
 from .mtp import mtp_compute
+
+
+def pool_buckets(np_max: int) -> list[int]:
+    """Every value ``sparse.pool_bucket`` can return for a sparse step (past TOPK_POOLS complete pools)."""
+    out, b = [], 1024
+    while b < np_max:
+        out.append(b)
+        b *= 2
+    return out + [np_max]
 
 
 class Graphs:
@@ -17,7 +29,10 @@ class Graphs:
         self.pool = torch.cuda.graph_pool_handle()
         self.main: dict[tuple[int, int], torch.cuda.CUDAGraph] = {}
         self.mtp: dict[int, torch.cuda.CUDAGraph] = {}
+        self.sparse: dict[tuple[int, int, int], torch.cuda.CUDAGraph] = {}      # (rows, parity, pool bucket)
+        self.sparse_mtp: dict[tuple[int, int], torch.cuda.CUDAGraph] = {}       # (rows, pool bucket)
         w, st = e.w, e.st
+        prof.active = False
         saved = list(st.cur)
         parities = (0, 1) if st.cur else (0,)
         with torch.no_grad():
@@ -42,4 +57,32 @@ class Graphs:
                     with torch.cuda.graph(g, pool=self.pool):
                         mtp_compute(w, st, e.mbuf, n)
                     self.mtp[n] = g
+            if st.index is not None and latent.ENABLED:
+                self._capture_sparse(e, main_rows, mtp_rows, parities)
         torch.cuda.synchronize()
+
+    def _capture_sparse(self, e, main_rows, mtp_rows, parities) -> None:
+        w, st = e.w, e.st
+        np_max = st.index[0][2].shape[0] - 2
+        saved = list(st.cur)
+        for bucket in pool_buckets(np_max):
+            for R in main_rows:
+                for parity in parities:
+                    st.cur = [parity] * len(st.cur)
+                    for _ in range(2):
+                        compute(w, st, e.buf, R, sparse_np=bucket)
+                    torch.cuda.synchronize()
+                    g = torch.cuda.CUDAGraph()
+                    with torch.cuda.graph(g, pool=self.pool):
+                        compute(w, st, e.buf, R, sparse_np=bucket)
+                    self.sparse[(R, parity, bucket)] = g
+            if w.mtp is not None:
+                for n in mtp_rows:
+                    for _ in range(2):
+                        mtp_compute(w, st, e.mbuf, n, sparse_np=bucket)
+                    torch.cuda.synchronize()
+                    g = torch.cuda.CUDAGraph()
+                    with torch.cuda.graph(g, pool=self.pool):
+                        mtp_compute(w, st, e.mbuf, n, sparse_np=bucket)
+                    self.sparse_mtp[(n, bucket)] = g
+        st.cur = saved

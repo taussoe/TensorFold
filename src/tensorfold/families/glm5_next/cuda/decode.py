@@ -21,6 +21,7 @@ from tensorfold.engine.exact_sampling import MARGIN, Sampling, choose_rows
 
 from . import glue, prof, qmm
 from .forward import Buffers, State, chunks_for, commit, compute, stage
+from .sparse import pool_bucket
 from .mtp import mtp_compute, mtp_stage
 from .weights import Weights
 
@@ -99,6 +100,7 @@ class Engine:
         self.last_hidden: torch.Tensor | None = None
         self.draft_n = w.head.n
         self.graphs = None
+        self.replays = {"main": 0, "sparse": 0, "mtp": 0, "sparse_mtp": 0, "eager": 0}   # steps by path
         if graphs:
             from .graphs import Graphs
 
@@ -113,10 +115,18 @@ class Engine:
 
         R = stage(self.w, self.st, self.buf, tokens)
         dense = self.st.pos + R <= self.w.cfg.dense_limit
-        g = self.graphs.main.get((R, self.st.parity)) if self.graphs is not None and dense else None
+        g, kind = None, "main"
+        if self.graphs is not None and dense:
+            g = self.graphs.main.get((R, self.st.parity))
+        elif self.graphs is not None and self.st.pos >= self.w.cfg.dense_limit and self.st.index is not None:
+            # every row past the dense limit: the sparse graph for this pool bucket (same kernels as eager)
+            bucket = pool_bucket(self.st.pos, R, self.st.index[0][2].shape[0] - 2)
+            g, kind = self.graphs.sparse.get((R, self.st.parity, bucket)), "sparse"
         if g is not None:
+            self.replays[kind] += 1
             g.replay()
             return self.buf.logits[:R]
+        self.replays["eager"] += 1
         return compute(self.w, self.st, self.buf, R, nch=chunks_for(self.st, R), host_pos=self.st.pos)
 
     def mtp(self, next_tokens: Sequence[int], hidden: torch.Tensor) -> torch.Tensor:
@@ -124,8 +134,15 @@ class Engine:
 
         n = mtp_stage(self.w, self.st, self.mbuf, next_tokens, hidden)
         dense = self.st.mtp_len + n <= self.w.cfg.dense_limit
-        g = self.graphs.mtp.get(n) if self.graphs is not None and not self.mbuf.zero_first and dense else None
+        g, kind = None, "mtp"
+        if self.graphs is not None and not self.mbuf.zero_first and dense:
+            g = self.graphs.mtp.get(n)
+        elif (self.graphs is not None and not self.mbuf.zero_first and self.st.index is not None
+              and self.st.mtp_len >= self.w.cfg.dense_limit):
+            bucket = pool_bucket(self.st.mtp_len, n, self.st.index[-1][2].shape[0] - 2)
+            g, kind = self.graphs.sparse_mtp.get((n, bucket)), "sparse_mtp"
         if g is not None:
+            self.replays[kind] += 1
             g.replay()
             return self.mbuf.logits[:1, :self.draft_n]
         from .attention import CHUNK
