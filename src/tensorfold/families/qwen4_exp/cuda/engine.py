@@ -79,7 +79,14 @@ class FlashNextEngine:
         captured = self.e.graphs.warm(self.depth + 1) if self.e.graphs is not None else 0
         self.eos = tuple(w.cfg.eos)
         self.served = 0
-        self.cache: list[tuple[list[int], dict]] = []    # (committed ids, what resuming from them needs)
+        # Prompt cache for several conversations (engine/ branch): (committed ids, snapshot) entries, least recently
+        # used first. The live caches hold one sequence (self.live); when another conversation is about to overwrite
+        # it, the entries whose rows live there get them copied out (State.save_rows), within TF_QWEN4_CACHE_GIB
+        # (default 4: on one Spark the n-gram tables need the page cache). Both ranks keep the same entries.
+        self.cache: list[tuple[list[int], dict]] = []
+        self.live: list[int] = []
+        self.cache_bytes = int(float(os.environ.get("TF_QWEN4_CACHE_GIB", "4")) * 2 ** 30)
+        self.cache_entries = int(os.environ.get("TF_QWEN4_CACHE_ENTRIES", "32"))
         self.serial = None                                # the serial requests' engine, made on first use
         rule = (f"1 to {self.depth} MTP drafts a round, a chain stops before a later draft under "
                 f"{self.confidence:.0%}" if self.depth else "no drafts: the serial reference, one token a round")
@@ -165,17 +172,44 @@ class FlashNextEngine:
         return best
 
     def _start_from(self, hit) -> None:
-        """Before a prefill: resuming overwrites the cache rows past the kept prefix, so the states that extend it
-        go; a fresh prompt overwrites them all."""
+        """Before a prefill, which rewrites the live caches past the resumed prefix: every kept entry whose rows
+        live there and are not a prefix of it gets them saved (oldest dropped first when the budget is spent), and
+        a saved entry resumed from gets its rows back."""
 
-        if hit is None:
-            self.cache = []
-        else:
-            n = len(hit[0])
-            self.cache = [c for c in self.cache if len(c[0]) <= n or c[0][:n] != hit[0]]
+        keep = list(hit[0]) if hit is not None else []
+        st = self.e.st
+        for entry in list(self.cache):
+            ids, snap = entry
+            n = len(ids)
+            if "rows" in snap or (n <= len(keep) and keep[:n] == ids):
+                continue
+            if self.live[:n] != ids:                      # its rows are gone already
+                self.cache.remove(entry)
+                continue
+            need = 28 * 1024 * n
+            while self._saved_bytes() + need > self.cache_bytes:
+                old = next((c for c in self.cache if "rows" in c[1]), None)
+                if old is None:
+                    break
+                self.cache.remove(old)
+            if self._saved_bytes() + need > self.cache_bytes:
+                self.cache.remove(entry)
+                continue
+            st.save_rows(snap["state"])
+            snap["rows"] = True
+        if hit is not None and "rows" in hit[1]:
+            st.load_rows(hit[1]["state"])
+            del hit[1]["rows"]
+            hit[1]["state"].pop("rows", None)
+            hit[1]["state"].pop("nbytes", None)
+
+    def _saved_bytes(self) -> int:
+        return sum(snap["state"].get("nbytes", 0) for _, snap in self.cache if "rows" in snap)
 
     def _remember(self, ids: list[int], snap: dict) -> None:
-        self.cache = [c for c in self.cache if c[0] != ids][-1:] + [(ids, snap)]
+        self.cache = [c for c in self.cache if c[0] != ids] + [(ids, snap)]
+        while len(self.cache) > self.cache_entries:
+            self.cache.pop(0)
 
     # -- decoding ------------------------------------------------------------------------------------------------
     def _limit(self, prompt: list[int], max_tokens: int) -> int:
@@ -210,6 +244,7 @@ class FlashNextEngine:
 
         t0 = time.perf_counter()
         self._start_from(hit)
+        self.live = list(prompt)
         first = prefill(self.e, prompt, sampling, resume=hit[1] if hit else None)
         # the prompt's state: the MTP head has absorbed every position but the last, whose streams resume needs
         self._remember(list(prompt), {"state": self.e.st.snapshot(),
@@ -225,6 +260,7 @@ class FlashNextEngine:
             stats.update(drafted=res.drafted, accepted=res.accepted, min_rows=min(res.widths, default=0))
         else:
             res = serial_decode(self.e, first, max_tokens, sampling, stop_eos=True, on_tokens=on_tokens)
+        self.live = list(prompt) + list(res.committed)
         if res.committed:          # the reply's state: every committed position is in the MTP cache
             self._remember(list(prompt) + res.committed, {"state": self.e.st.snapshot(), "tail": None})
         stats.update(decode_s=round(res.seconds, 4), rounds=res.rounds, decode_tps=round(res.tokens_per_second, 2))

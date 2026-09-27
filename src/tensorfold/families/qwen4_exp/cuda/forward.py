@@ -143,6 +143,7 @@ class State:
         self.vc = [torch.zeros_like(x) for x in self.kc]
         self.ikc = [torch.zeros((capacity, c.index_dim), dtype=torch.bfloat16, device=dev) for _ in att]
         nb = -(-capacity // c.index_ratio)
+        self.index_ratio = c.index_ratio
         self.pooled = [torch.zeros((nb, c.index_dim), dtype=torch.bfloat16, device=dev) for _ in att]
         wide = c.streams * c.hidden
         self.ple_tail = torch.zeros(((c.ple_kernel - 1) * c.ngram_size, wide), dtype=torch.bfloat16, device=dev)
@@ -210,6 +211,28 @@ class State:
                 "ple_tail": self.ple_tail.clone(),
                 "ple_history": None if self.ple_history is None else self.ple_history.copy(),
                 "mtp_len": self.mtp_len - self.mtp_drafted}
+
+    def _row_views(self, n: int, m: int) -> list:
+        """Views of every attention cache row a state of n committed tokens (m in the MTP head's caches) depends
+        on: keys, values, index keys and the pooled index blocks, of the model and of the MTP head."""
+        ratio = self.index_ratio
+        views = []
+        for kc, vc, ikc, pooled in zip(self.kc, self.vc, self.ikc, self.pooled):
+            views += [kc[:n], vc[:n], ikc[:n], pooled[:n // ratio + 1]]
+        if m > 0 and hasattr(self, "mtp_kc"):
+            views += [self.mtp_kc[:m], self.mtp_vc[:m], self.mtp_ikc[:m], self.mtp_pooled[:m // ratio + 1]]
+        return views
+
+    def save_rows(self, snap: dict) -> None:
+        """Copy a snapshot's attention rows out of the live caches (another conversation is about to overwrite
+        them); ``load_rows`` puts them back. About 28 KB a token on one Spark."""
+        rows = [v.clone() for v in self._row_views(snap["pos"], max(snap["mtp_len"], 0))]
+        snap["rows"] = rows
+        snap["nbytes"] = sum(r.numel() * r.element_size() for r in rows)
+
+    def load_rows(self, snap: dict) -> None:
+        for dst, src in zip(self._row_views(snap["pos"], max(snap["mtp_len"], 0)), snap["rows"]):
+            dst.copy_(src)
 
     def restore(self, snap: dict) -> None:
         self.rec[0].copy_(snap["rec"])

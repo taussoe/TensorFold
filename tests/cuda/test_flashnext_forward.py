@@ -273,6 +273,44 @@ def test_prefix_reuse_and_the_serial_switch(tmp_path, sampling):
         assert serial == warm and serial_stats["drafts"] is False and serial_stats["cached"] == 0
         again, again_stats = ask(prompt + [9])                   # the kept states survived the serial request
         assert again_stats["cached"] >= len(prompt)
-        ask([1500, 9, 10])                                       # an unrelated prompt: nothing to resume from
+        eng.cache.clear()                                        # every kept state goes: the next prefill is fresh
+        eng.live = []
         cold, cold_stats = ask(prompt)
         assert cold_stats["cached"] == 0 and cold == warm, extend
+
+
+@pytest.mark.parametrize("n", [40, 2100], ids=["short", "sparse"])
+def test_switching_conversations_resumes_each_like_a_fresh_prefill(tmp_path, n):
+    """Conversation A, then B (which takes the live caches), then A and B again: each resumes from its saved rows
+    and decodes what the serial reference (a fresh prefill) decodes."""
+
+    import numpy as np
+
+    from tensorfold.engine.exact_sampling import Sampling
+    from tensorfold.families.qwen4_exp.cuda.engine import FlashNextEngine
+
+    from test_flashnext_tp import _checkpoint
+
+    _checkpoint(tmp_path)
+    eng = FlashNextEngine(tmp_path, depth=4, confidence=0.001, draft_vocab=None, max_len=2600, prefetch=False)
+    sampling = Sampling(9, 1.0, 20, 0.95)
+    rng = np.random.default_rng(n)
+
+    def ask(prompt, **kw):
+        got: list[int] = []
+        stats = eng.generate(prompt, 12, sampling, lambda new: got.extend(new), **kw)
+        return got, stats
+
+    a = [int(t) for t in rng.integers(0, 1000, size=n)]
+    b = [int(t) for t in rng.integers(0, 1000, size=n + 7)]
+    reply_a, _ = ask(a)
+    reply_b, _ = ask(b)
+    next_a = a + reply_a + [401, 33]
+    warm_a, stats = ask(next_a)
+    assert stats["cached"] >= len(a) + len(reply_a) - 1, stats
+    next_b = b + reply_b + [402, 34]
+    warm_b, stats = ask(next_b)
+    assert stats["cached"] >= len(b) + len(reply_b) - 1, stats
+    serial_a, _ = ask(next_a, draft=False)
+    serial_b, _ = ask(next_b, draft=False)
+    assert warm_a == serial_a and warm_b == serial_b
