@@ -103,3 +103,17 @@ def test_a_follow_up_resumes_from_its_kept_prompt(engine):
         dec.finish(dec.round())
     assert len(s1.out) == 12 and s2.cached == len(first)
     assert s2.out == _generate(engine, follow, None, draft=False, tokens=12)[0]
+
+
+def test_repeated_prompts_never_lose_a_slot(engine):
+    """The same prompt again and again, alone and two at once, keeps every slot either free, kept or busy."""
+    dec = _decoder(engine, slots=2)
+    prompt = _prompt(31, 50)
+    for batch in (1, 1, 2, 1, 2, 2):
+        streams = [Stream(list(prompt), 4, None, draft=True, stop_eos=False) for _ in range(batch)]
+        for st in streams:
+            dec.admit(st)
+        while dec.live():
+            dec.finish(dec.round())
+        held = set(dec.free) | {k[1] for k in dec.kept}
+        assert held == {0, 1}, (dec.free, dec.kept)

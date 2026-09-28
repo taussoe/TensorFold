@@ -158,11 +158,15 @@ class MultiDecoder:
         return snap
 
     def _remember(self, ids: list[int], slot: int, snap) -> None:
+        """Keep a prompt's end in its slot; a slot another entry for the same ids (or the oldest entry) held goes back to the free list."""
+        gone = [k[1] for k in self.kept if k[0] == ids and k[1] != slot]
         self.kept = [k for k in self.kept if k[0] != ids and k[1] != slot] + [(ids, slot, snap)]
         while len(self.kept) > self.keep:
-            gone = self.kept.pop(0)[1]
-            if gone not in self._busy() and gone not in self.free:
-                self.free.append(gone)
+            gone.append(self.kept.pop(0)[1])
+        busy = self._busy()
+        for old in gone:
+            if old != slot and old not in busy and old not in self.free and all(k[1] != old for k in self.kept):
+                self.free.append(old)
 
     # -- streams ----------------------------------------------------------------------------------------------
     @torch.no_grad()
