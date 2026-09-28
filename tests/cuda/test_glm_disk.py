@@ -112,3 +112,27 @@ def test_a_rank_without_the_prompt_prefills_afresh(model, tmp_path):
     finally:
         e._gather_ints = real
     assert stats["cached"] == 0
+
+
+def test_a_prompt_resumes_from_the_last_checkpoint_before_it_leaves_another(model, cold, tmp_path):
+    """Checkpoints part way through a prompt: a prompt that shares only its start (an edited middle, another agent
+    with the same tool list) resumes from the last one before they part, and replies as a fresh prefill does."""
+    e = _engine(model, tmp_path)
+    e.checkpoint_after = lambda pos: (pos // 16 + 1) * 16
+    shared = _ids(31, 50)
+    first = shared + _ids(32, 40)
+    _generate(e, first, SAMPLING, tokens=8)
+    assert {len(x.ids) for x in e.disk.entries.values()} >= {16, 32, 48, len(first)}
+    _forget(e)
+    other = shared + _ids(33, 30)                      # parts from ``first`` at token 50
+    warm, stats = _generate(e, other, SAMPLING)
+    assert stats["cached"] == 48
+    _forget(cold)
+    fresh, stats = _generate(cold, other, SAMPLING)
+    assert stats["cached"] == 0 and warm == fresh
+    # drafted still equals serial with checkpoints written along the way
+    _forget(e)
+    again = shared + _ids(34, 70)
+    drafted, _ = _generate(e, again, SAMPLING)
+    serial, _ = _generate(e, again, SAMPLING, draft=False)
+    assert drafted == serial

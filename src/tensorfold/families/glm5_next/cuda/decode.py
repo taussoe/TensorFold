@@ -304,8 +304,12 @@ def restore(e: Engine, snap: Snapshot, drafter=None) -> None:
 # -- prefill ----------------------------------------------------------------------------------------------------
 @torch.no_grad()
 def prefill(e: Engine, prompt: Sequence[int], sampling: Sampling | None, *, mtp: bool = True, drafter=None,
-            resume: Snapshot | None = None) -> int:
-    """Commit the prompt in chunks and sample its first token; a resumed prompt ends in a fresh prefill's state."""
+            resume: Snapshot | None = None, mark=None, keep=None) -> int:
+    """Commit the prompt in chunks and sample its first token; a resumed prompt ends in a fresh prefill's state.
+
+    ``mark(pos)``: the next checkpoint position after pos (or None). Chunks end there, and ``keep`` gets a snapshot
+    of the prompt up to it, as the snapshot of a prompt ending there would be (its last row's MTP input pending).
+    """
 
     if not prompt:
         raise ValueError("prefill requires at least one token")
@@ -330,8 +334,14 @@ def prefill(e: Engine, prompt: Sequence[int], sampling: Sampling | None, *, mtp:
             b.overlay = None
     last = None
     prof.active = True
-    for start in range(begin, len(prompt), e.prefill_rows):
-        chunk = list(prompt[start:start + e.prefill_rows])
+    start = begin
+    while start < len(prompt):
+        end = min(start + e.prefill_rows, len(prompt))
+        at = mark(start) if mark is not None else None
+        point = at is not None and start < at < end
+        if point:
+            end = at
+        chunk = list(prompt[start:end])
         R = len(chunk)
         b.overlay = e.overlay(start, R)
         last = compute(w, st, b, stage(w, st, b, chunk), nch=chunks_for(st, R), host_pos=st.pos).clone()
@@ -339,8 +349,12 @@ def prefill(e: Engine, prompt: Sequence[int], sampling: Sampling | None, *, mtp:
         e.last_hidden = b.fnormed[R - 1:R].clone()
         if drafter is not None:
             drafter.add_taps(e.tap_rows(R, b))
+        held = None
         if use_mtp:
             nxt = list(prompt[start + 1:start + R + 1])
+            if point and nxt:                         # the last row waits, as at a prompt's end
+                held = b.fnormed[R - 1:R].clone()
+                nxt = nxt[:-1]
             if nxt:
                 with prof.timed("mtp absorb"):
                     b.overlay = e.overlay(start + 1, len(nxt))
@@ -348,6 +362,14 @@ def prefill(e: Engine, prompt: Sequence[int], sampling: Sampling | None, *, mtp:
                     b.overlay = None
         with prof.timed("commit"):
             commit(w, st, b, R, R)
+        if point:
+            with prof.timed("checkpoint"):
+                keep(take_snapshot(e, prompt[:end], held if use_mtp else None, mtp=use_mtp, drafter=drafter))
+            if held is not None:
+                b.overlay = e.overlay(end, 1)
+                _absorb_rows(e, held, [prompt[end]])
+                b.overlay = None
+        start = end
     prof.active = False
     prof.report(len(prompt) - begin)
     return e.sample(last, [len(prompt)], sampling)[0]

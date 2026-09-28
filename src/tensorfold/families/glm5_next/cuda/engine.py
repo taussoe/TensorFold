@@ -73,6 +73,14 @@ def decode_policy(code: list[int]):
     return DepthPolicy(min(most, MAX_ROWS - 1), fixed=True) if kind == 1 else None
 
 
+def checkpoint_after(pos: int) -> int:
+    """Where a long prompt's prefill also writes its state to disk (``TF_GLM_DISK_DIR``), so a prompt that leaves it
+    part way (a client that trimmed or dropped earlier text, an agent sharing only the tool list) resumes from the
+    last one before it: every 4,096 tokens up to 32,768, then every 16,384."""
+
+    return (pos // 4096 + 1) * 4096 if pos < 32768 else (pos // 16384 + 1) * 16384
+
+
 def _f64_ints(x: float) -> list[int]:
     return list(struct.unpack("<2i", struct.pack("<d", float(x))))
 
@@ -155,6 +163,7 @@ class GlmEngine:
         self.w = w
         self.tower = vision.Tower(model_dir) if sees else None
         self.disk = None                 # kept prompts on disk (TF_GLM_DISK_DIR, one stream only; set below)
+        self.checkpoint_after = checkpoint_after
         if rank == 0:
             print("[tensorfold] GLM-5.3-Flash image input: " + ("on (vision tower on rank 0)" if sees else
                   "off (" + ("TF_GLM_VISION=0" if os.environ.get("TF_GLM_VISION", "1") == "0" else
@@ -481,8 +490,11 @@ class GlmEngine:
             hit.rows, hit.nbytes = None, 0            # live again
         self.live = list(prompt)
         self.e.images = self._image_rows(prompt, cut, images)
+        marks = self.disk is not None and draft
         try:
-            first = prefill(self.e, prompt, sampling, mtp=use_mtp, drafter=drafter, resume=hit)
+            first = prefill(self.e, prompt, sampling, mtp=use_mtp, drafter=drafter, resume=hit,
+                            mark=self.checkpoint_after if marks else None,
+                            keep=(lambda snap: self.disk.put(self.e, snap)) if marks else None)
         finally:
             self.e.images = None
         prefill_s = time.perf_counter() - t0
