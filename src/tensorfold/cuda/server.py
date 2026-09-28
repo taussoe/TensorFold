@@ -458,7 +458,11 @@ def make_handler(app: App):
 
         def do_GET(self):
             if self.path.rstrip("/") in ("/v1/models", "/models"):
-                self._json(200, {"object": "list", "data": [{"id": app.served, "object": "model", "owned_by": "tensorfold"}]})
+                model = {"id": app.served, "object": "model", "owned_by": "tensorfold"}
+                window = app.effective_context_window
+                if window:                   # the served window, as vLLM reports it, so clients size their history
+                    model["max_model_len"] = model["context_window"] = int(window)
+                self._json(200, {"object": "list", "data": [model]})
             elif self.path.rstrip("/") in ("/health", "/v1/health"):
                 self._json(200, {"ok": True})
             else:
