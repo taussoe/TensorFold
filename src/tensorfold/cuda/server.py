@@ -377,6 +377,13 @@ class App:
         if tail:
             final["content"] = tail
         finish = "tool_calls" if calls else ("stop" if stopped["stop"] or (out and out[-1] in ends) else "length")
+        s = stats or {}
+        prefill_s, decode_s = float(s.get("prefill_s") or 0.0), float(s.get("decode_s") or 0.0)
+        rate = f"{(len(out) - 1) / decode_s:.1f} tok/s" if decode_s > 0 and len(out) > 1 else "-"
+        print(f"[tensorfold] request: {len(prompt)} prompt tokens ({int(s.get('cached') or 0)} resumed), prefill "
+              f"{prefill_s:.1f}s; {len(out)} reply tokens in {decode_s:.1f}s ({rate}), {len(reasoning)} chars of "
+              f"thinking, finish {finish}{', tools ' + ','.join(c['function']['name'] for c in calls) if calls else ''}",
+              flush=True)
         if body.get("return_token_ids"):              # the reply's ids in the "tensorfold" block, for exactness checks
             stats = {**(stats or {}), "token_ids": [int(t) for t in out]}
         return {"final": final, "calls": calls, "finish": finish, "content": content, "reasoning": reasoning,
