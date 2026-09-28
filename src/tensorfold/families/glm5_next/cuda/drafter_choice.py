@@ -68,8 +68,12 @@ class DrafterChoice:
 @torch.no_grad()
 def auto_decode(e: Engine, drafter, pending: int, count: int, sampling: Sampling | None, *,
                 choice: DrafterChoice | None,
-                m_policy: DepthPolicy, f_policy: DepthPolicy, stop_eos: bool = False, on_tokens=None) -> DecodeResult:
-    """Drafted decoding with ``choice`` picking each round's drafter; drafts only propose, so it equals serial."""
+                m_policy: DepthPolicy, f_policy: DepthPolicy, stop_eos: bool = False, on_tokens=None,
+                lookup=None) -> DecodeResult:
+    """Drafted decoding with ``choice`` picking each round's drafter; drafts only propose, so it equals serial.
+
+    ``lookup`` (``lookup.PromptLookup`` over the prompt): a round whose last tokens stand earlier in the context
+    verifies the tokens that followed them there instead (arm "p"); its kept rows join the MTP backlog."""
 
     w, st, b = e.w, e.st, e.buf
     cap = 256                               # backlog rows a drafter may owe before it absorbs them anyway
@@ -86,14 +90,19 @@ def auto_decode(e: Engine, drafter, pending: int, count: int, sampling: Sampling
     depths: list[int] = []
     keeps: list[int] = []
     arms: list[str] = []
-    last = {"m": (0, 0), "f": (0, 0)}
+    last = {"m": (0, 0), "f": (0, 0), "p": (0, 0)}
+    if lookup is not None:
+        lookup.extend([pending])
     _sync(w)
     start = time.perf_counter()
     while len(out) < count and not (stop_eos and out[-1] in w.cfg.eos):
-        arm = choice.pick() if choice is not None else "m"
         room = count - len(out)
         t0 = time.perf_counter()
-        if arm == "m":
+        copied = lookup.propose(room) if lookup is not None else []
+        arm = "p" if copied else (choice.pick() if choice is not None else "m")
+        if arm == "p":
+            backlog, drafts, steps = 0, copied, 0
+        elif arm == "m":
             backlog = len(m_next)
             depth = max(1, min(m_policy.next(*last["m"]), room))
             drafts = draft(e, m_rows[:backlog], m_next, st.pos + 1, depth, sampling, m_policy.confidence)
@@ -134,8 +143,10 @@ def auto_decode(e: Engine, drafter, pending: int, count: int, sampling: Sampling
                 n_f = 0
             f_taps[n_f:n_f + keep].copy_(e.tap_rows(keep))
             n_f += keep
+        if lookup is not None:
+            lookup.extend(sampled[:keep])
         t5 = time.perf_counter()
-        if choice is not None:
+        if choice is not None and arm != "p":
             choice.record(arm, R, steps, backlog, keep)
         last[arm] = (len(drafts), keep - 1)
         rounds += 1

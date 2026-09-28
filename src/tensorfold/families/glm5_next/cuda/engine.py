@@ -115,7 +115,7 @@ class GlmEngine:
         # rank 0 encodes images (its folder holds the vision tower): the tower and its largest image's scratch
         sees = rank == 0 and os.environ.get("TF_GLM_VISION", "1") != "0" and vision.available(model_dir)
         seeing = vision.tower_bytes(model_dir) + vision.WORKSPACE if sees else 0
-        self.capacity_plan = admit(model_dir, context if explicit else cfg.dense_limit, explicit, torch,
+        self.capacity_plan = self._admit(admit, model_dir, context if explicit else cfg.dense_limit, explicit, torch,
                                    lambda text: with_fixed(mla_geometry(text, 2, MAX_ROWS, minimum_slots=DENSE_CAPACITY,
                                                                         latent=LATENT, sequences=max(1, parallel)),
                                                            seeing),
@@ -215,6 +215,20 @@ class GlmEngine:
             if rank == 0:
                 print(f"[tensorfold] kept prompts on disk: {len(self.disk.entries)} in {folder} "
                       f"({self.disk.held() / 2 ** 30:.1f} of {self.disk.budget / 2 ** 30:.0f} GiB)", flush=True)
+
+    def _admit(self, admit, *args, **kwargs) -> dict:
+        """``admit``; a refusal (both ranks reach the same one) is printed at once and ends the process: unwinding
+        with the NCCL communicator open held a refused start for half an hour before its message appeared."""
+
+        from tensorfold.cuda.comm import NCCL
+
+        try:
+            return admit(*args, **kwargs)
+        except ValueError as exc:
+            if not isinstance(self.comm, NCCL):     # tests' stand-in communicators unwind as usual
+                raise
+            print(f"tensorfold: {exc}", flush=True)
+            os._exit(1)
 
     def _calibrate(self) -> dict:
         """Per-piece ms for ``drafter_choice.DrafterChoice``: fastest of interleaved passes, equal on both ranks."""
@@ -493,9 +507,12 @@ class GlmEngine:
             if drafter is not None and (greedy or sampled_too):
                 choice = DrafterChoice(self.costs, first="f" if greedy else "m", explore=explore, every=every,
                                        margin=margin)
+            from .lookup import PromptLookup
+
+            lookup = PromptLookup(prompt) if os.environ.get("TF_GLM_LOOKUP", "1") != "0" else None
             res = auto_decode(self.e, drafter, first, max_tokens, sampling, choice=choice, m_policy=m_policy,
                               f_policy=DepthPolicy(5, fixed=True, confidence=0.3), stop_eos=stop_eos,
-                              on_tokens=on_tokens)
+                              on_tokens=on_tokens, lookup=lookup)
         elif use_dflash:
             res = dflash_decode(self.e, self.drafter, first, max_tokens, sampling, policy=policy, stop_eos=stop_eos,
                                 on_tokens=on_tokens)

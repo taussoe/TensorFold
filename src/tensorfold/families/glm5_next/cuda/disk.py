@@ -85,8 +85,19 @@ def _write(path: Path, meta: dict, tensors: list[tuple[str, torch.Tensor]]) -> i
                 f.write(part.view(torch.uint8).numpy().tobytes() if part.dtype != torch.uint8 else part.numpy().tobytes())
         f.flush()
         os.fsync(f.fileno())
+        _forget_pages(f.fileno())
     os.replace(tmp, path)
     return 8 + len(head) + offset
+
+
+def _forget_pages(fd: int) -> None:
+    """Drop a file's pages from the page cache: on GB10 the GPU's free memory is MemFree, which counts them as used."""
+
+    if hasattr(os, "posix_fadvise"):
+        try:
+            os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+        except OSError:
+            pass
 
 
 class _Reader:
@@ -96,6 +107,12 @@ class _Reader:
             info = json.loads(f.read(n))
         self.meta, self.layout, self.base = info["meta"], info["tensors"], 8 + n
         self.map = np.memmap(path, dtype=np.uint8, mode="r")
+
+    def close(self) -> None:
+        path = self.map.filename
+        del self.map
+        with open(path, "rb") as f:
+            _forget_pages(f.fileno())
 
     def __contains__(self, name: str) -> bool:
         return name in self.layout
@@ -147,6 +164,7 @@ class Store:
                     raise ValueError("another engine's prompt")
                 ids = r.get("ids").numpy()
                 meta = r.meta
+                r.close()
             except Exception:  # noqa: BLE001 - unreadable or foreign: not ours to keep
                 path.unlink(missing_ok=True)
                 continue
@@ -268,6 +286,8 @@ class Store:
             if link is entry:
                 snap.rec, snap.conv = r.get("rec", dev), r.get("conv", dev)
                 snap.pending = r.get("pending", dev) if "pending" in r else None
+            torch.cuda.synchronize()
+            r.close()
             link.used = time.time()
         torch.cuda.synchronize()
         return snap
