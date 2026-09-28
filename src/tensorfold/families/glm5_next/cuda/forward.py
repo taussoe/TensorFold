@@ -46,6 +46,7 @@ class Buffers:
             self.kscratch = kda_mod.KDAScratch(rows, LL, dev)
         self.hin = torch.empty((rows, c.hidden), dtype=torch.bfloat16, device=dev)      # MTP input rows
         self.zero_first = False          # MTP: this step starts at position 0 (its embedding is zeroed)
+        self.zero_rows: list[int] = []   # MTP rows at position 0 (their embeddings are zeroed)
         self.x = torch.empty((rows, S * D), dtype=bf, device=dev)
         self.normed = torch.empty((rows, D), dtype=bf, device=dev)
         self.xs = torch.empty((rows, D // 64), dtype=f32, device=dev)
@@ -58,6 +59,10 @@ class Buffers:
         self.xs_fa = torch.empty((rows, 2), dtype=f32, device=dev)
         self.xs_ga = torch.empty((rows, 2), dtype=f32, device=dev)
         self.kxs = torch.empty((rows, LL * 128 // 64), dtype=f32, device=dev)
+        if not prefill:                  # several streams' rows: the projection rows and chain outputs of all of them
+            kl = [l for l in w.layers if l.kind == "kda"]
+            self.mproj = torch.zeros((rows, kl[0].kda.proj.n if kl else 0), dtype=bf, device=dev)
+            self.kout = torch.zeros((rows, LL * 128), dtype=bf, device=dev)
         # DSA
         self.dp = torch.empty((rows, c.q_lora + c.kv_lora), dtype=bf, device=dev)
         self.qr = torch.empty((rows, c.q_lora), dtype=bf, device=dev)
@@ -243,30 +248,44 @@ def out_proj(w: Weights, b: Buffers, x: torch.Tensor, q: qmm.Q4, xs: torch.Tenso
     return gather(w, b, R)
 
 
-def kda_block(layer: LayerW, w: Weights, st: State, b: Buffers, R: int) -> torch.Tensor:
+def kda_block(layer: LayerW, w: Weights, segs: Sequence, b: Buffers, R: int) -> torch.Tensor:
+    """segs: (state, a0, a1) of each stream's rows; one stream's rows project into its state, several into b.mproj."""
+
     c = w.cfg
     k = layer.kda
-    li = st.kda_index[layer.index]
-    p = b.kproj[0, :R] if b.prefill else st.proj[li, :R]
+    st0 = segs[0][0]
+    li = st0.kda_index[layer.index]
+    one = len(segs) == 1
+    p = b.kproj[0, :R] if b.prefill else st0.proj[li, :R] if one else b.mproj[:R]
     mm(b, b.normed[:R], k.proj, b.xs[:R], p)
     fa = p[:, k.fa_off:k.fa_off + 128]
     ga = p[:, k.ga_off:k.ga_off + 128]
     pre = b.prefill
     mm(b, fa, k.fb, None if pre else qmm.group_sums(fa, b.xs_fa[:R]), b.ka[:R])
     mm(b, ga, k.gb, None if pre else qmm.group_sums(ga, b.xs_ga[:R]), b.kg[:R])
-    cur = st.cur[li]
-    out = kda_mod.chain(p, k.b_off, b.ka[:R], b.kg[:R], st.conv[li], k.conv, st.rec[cur, li], k.a_log, k.dt_bias,
-                        k.norm, c.eps, c.lower, R, b.kscratch if pre else st.scratch[li], st.rec[1 - cur, li])
-    if pre:                              # a prompt chunk keeps every row: the layer commits now
-        st.cur[li] = 1 - cur
-        _shift_conv(st.conv[li:li + 1], b.kproj[:, :R], R)
+    if one:
+        st = st0
+        cur = st.cur[li]
+        out = kda_mod.chain(p, k.b_off, b.ka[:R], b.kg[:R], st.conv[li], k.conv, st.rec[cur, li], k.a_log, k.dt_bias,
+                            k.norm, c.eps, c.lower, R, b.kscratch if pre else st.scratch[li], st.rec[1 - cur, li])
+        if pre:                          # a prompt chunk keeps every row: the layer commits now
+            st.cur[li] = 1 - cur
+            _shift_conv(st.conv[li:li + 1], b.kproj[:, :R], R)
+    else:
+        for st, a0, a1 in segs:          # each stream's chain on its own state; its rows go to its proj for commit
+            n = a1 - a0
+            st.proj[li, :n].copy_(p[a0:a1])
+            cur = st.cur[li]
+            o = kda_mod.chain(st.proj[li, :n], k.b_off, b.ka[a0:a1], b.kg[a0:a1], st.conv[li], k.conv, st.rec[cur, li],
+                              k.a_log, k.dt_bias, k.norm, c.eps, c.lower, n, st.scratch[li], st.rec[1 - cur, li])
+            b.kout[a0:a1].copy_(o)
+        out = b.kout[:R]
     return out_proj(w, b, out, k.o, None if pre else qmm.group_sums(out, b.kxs[:R]), R)
 
 
-def dsa_block(layer: LayerW, w: Weights, kc: torch.Tensor, vc: torch.Tensor, pos_dev: torch.Tensor, b: Buffers,
-              R: int, nch: int | None, index=None, host_pos: int | None = None,
+def dsa_block(layer: LayerW, w: Weights, caches: Sequence, b: Buffers, R: int, nch: int | None,
               sparse_np: int | None = None) -> torch.Tensor:
-    """Write every index key and pool; rows past the dense limit attend to their top-512 pools (host_pos eager, or sparse_np in a captured graph)."""
+    """caches: (latent or key cache, value cache, pos_dev, index caches, host_pos, a0, a1) of each stream's rows; rows past the dense limit attend to their top-512 pools."""
 
     c = w.cfg
     a = layer.dsa
@@ -276,9 +295,10 @@ def dsa_block(layer: LayerW, w: Weights, kc: torch.Tensor, vc: torch.Tensor, pos
     HL = a.heads
     mm(b, b.qr[:R], a.q_b, b.xs_qr[:R], b.q[:R].view(R, HL * c.qk_dim))
     if a.absorb is not None:
-        return _dsa_latent(a, w, kc, pos_dev, b, R, nch, index, host_pos, sparse_np)
-    if sparse_np is not None:
-        raise ValueError("sparse CUDA graphs need the latent cache (TF_GLM_LATENT=1)")
+        return _dsa_latent(a, w, caches, b, R, nch, sparse_np)
+    if sparse_np is not None or len(caches) != 1:
+        raise ValueError("sparse CUDA graphs and several streams need the latent cache (TF_GLM_LATENT=1)")
+    kc, vc, pos_dev, index, host_pos, _, _ = caches[0]
     mm(b, b.lat[:R], a.kv_k, b.xs_lat[:R], b.kn[:R].view(R, HL * c.qk_dim))
     mm(b, b.lat[:R], a.kv_v, b.xs_lat[:R], b.vn[:R].view(R, HL * c.v_dim))
     kv_write(b.kn[:R], b.vn[:R], kc, vc, pos_dev)
@@ -304,40 +324,53 @@ def dsa_block(layer: LayerW, w: Weights, kc: torch.Tensor, vc: torch.Tensor, pos
     return out_proj(w, b, o, a.o, None if b.prefill else qmm.group_sums(o, b.xs_ao[:R]), R)
 
 
-def _dsa_latent(a, w: Weights, lc: torch.Tensor, pos_dev: torch.Tensor, b: Buffers, R: int, nch: int | None,
-                index, host_pos: int | None, sparse_np: int | None = None) -> torch.Tensor:
-    """DSA on the latent cache: the same indexer and selection, attention over latents with kv_b's key blocks absorbed into the query."""
+def _dsa_latent(a, w: Weights, caches: Sequence, b: Buffers, R: int, nch: int | None,
+                sparse_np: int | None = None) -> torch.Tensor:
+    """DSA on the latent cache: the same indexer and selection, attention over latents with kv_b's key blocks absorbed into the query, each stream on its own cache."""
+
+    from .attention import CHUNK
 
     c = w.cfg
     HL = a.heads
     s = b.lat_s
-    with prof.timed("dsa: latent write"):
-        latent.latent_write(b.lat[:R], lc, pos_dev)
-    # sparse_np: every row is past the dense limit (a captured graph); else the host position decides
-    all_sparse = sparse_np is not None or (host_pos is not None and host_pos >= c.dense_limit)
-    sparse_rows = index is not None and (all_sparse or (host_pos is not None and host_pos + R - 1 >= c.dense_limit))
-    if index is not None:
-        ik, ig, pk = index
-        ix = a.index
+    ix = a.index
+    scale = c.qk_dim ** -0.5
+    indexed = any(v[3] is not None for v in caches)
+    if indexed:
         with prof.timed("dsa: indexer update"):
             mm(b, b.normed[:R], ix.kw, b.xs[:R], b.ikr[:R])
             glue.router(b.normed[:R], ix.gate, b.igr[:R])
-            sparse.index_update(b.ikr[:R, :c.index_dim], b.igr[:R], ix.ln_w, ix.ln_b, ix.ape, ik, ig, pk, pos_dev)
     with prof.timed("dsa: absorb"):
         qa = latent.absorb_q(b.q[:R], a.absorb, s.qa[:R])
     ol = s.ol[:R]
-    scale = c.qk_dim ** -0.5
-    if not all_sparse:
-        # Rows past the dense limit are recomputed sparsely below, so the dense pass needs only the chunks up to it.
-        with prof.timed("dsa: dense attention"):
-            latent.attention(qa, lc, pos_dev, s, scale=scale, nch=min(nch or s.nch, s.nch), out=ol)
-    if sparse_rows:
-        with prof.timed("dsa: select tokens"):
-            mm(b, b.qr[:R], ix.qb, b.xs_qr[:R], b.qi[:R])
-            tokens, counts = sparse.select_tokens(b.qi[:R], b.ikr[:R, c.index_dim:], pk, host_pos, R,
-                                                  pk.shape[0] - 2, pos_dev, bucket=sparse_np)
-        with prof.timed("dsa: sparse attention"):
-            latent.sparse_attention(qa, lc, tokens, counts, ol, scale)
+    picked = False
+    for lc, _, pos_dev, index, host_pos, a0, a1 in caches:
+        n = a1 - a0
+        with prof.timed("dsa: latent write"):
+            latent.latent_write(b.lat[a0:a1], lc, pos_dev)
+        # sparse_np: every row is past the dense limit (a captured graph); else the host position decides
+        all_sparse = sparse_np is not None or (host_pos is not None and host_pos >= c.dense_limit)
+        sparse_rows = index is not None and (all_sparse or (host_pos is not None and host_pos + n - 1 >= c.dense_limit))
+        if index is not None:
+            ik, ig, pk = index
+            with prof.timed("dsa: indexer update"):
+                sparse.index_update(b.ikr[a0:a1, :c.index_dim], b.igr[a0:a1], ix.ln_w, ix.ln_b, ix.ape, ik, ig, pk,
+                                    pos_dev)
+        if not all_sparse:
+            # rows past the dense limit are recomputed sparsely below, so the dense pass needs only the chunks up to it
+            chunks = nch if host_pos is None else -(-(host_pos + n) // CHUNK)
+            with prof.timed("dsa: dense attention"):
+                latent.attention(qa[a0:a1], lc, pos_dev, s, scale=scale, nch=min(chunks or s.nch, s.nch),
+                                 out=ol[a0:a1])
+        if sparse_rows:
+            if not picked:
+                mm(b, b.qr[:R], ix.qb, b.xs_qr[:R], b.qi[:R])
+                picked = True
+            with prof.timed("dsa: select tokens"):
+                tokens, counts = sparse.select_tokens(b.qi[a0:a1], b.ikr[a0:a1, c.index_dim:], pk, host_pos, n,
+                                                      pk.shape[0] - 2, pos_dev, bucket=sparse_np)
+            with prof.timed("dsa: sparse attention"):
+                latent.sparse_attention(qa[a0:a1], lc, tokens, counts, ol[a0:a1], scale)
     with prof.timed("dsa: expand"):
         o = latent.expand_v(ol, a.absorb, b.vn[:R]).view(R, HL * c.v_dim)
     return out_proj(w, b, o, a.o, qmm.group_sums(o, b.xs_ao[:R]), R)
@@ -379,8 +412,14 @@ def moe_block(layer: LayerW, w: Weights, b: Buffers, R: int) -> torch.Tensor:
         return gather(w, b, R)
 
 
-def layer_forward(layer: LayerW, w: Weights, st: State, b: Buffers, R: int, nch: int | None = None,
-                  host_pos: int | None = None, sparse_np: int | None = None) -> None:
+def main_caches(segs: Sequence, di: int, eager: bool) -> list:
+    """The main model's DSA layer di cache views of each stream (host positions only in eager steps)."""
+    return [(st.kc[di], st.vc[di], st.pos_dev, st.index[di] if st.index is not None else None,
+             st.pos if eager else None, a0, a1) for st, a0, a1 in segs]
+
+
+def layer_forward(layer: LayerW, w: Weights, segs: Sequence, b: Buffers, R: int, nch: int | None = None,
+                  eager: bool = True, sparse_np: int | None = None) -> None:
     c = w.cfg
     x = b.x[:R]
     h = layer.attn_hc
@@ -388,12 +427,11 @@ def layer_forward(layer: LayerW, w: Weights, st: State, b: Buffers, R: int, nch:
                 b.hcpart[:R], c.eps, c.hc_eps, c.hc_iters)
     if layer.kind == "kda":
         with prof.timed("kda"):
-            g = kda_block(layer, w, st, b, R)
+            g = kda_block(layer, w, segs, b, R)
     else:
-        di = st.dsa_index[layer.index]
+        di = segs[0][0].dsa_index[layer.index]
         with prof.timed("dsa (total)"):
-            g = dsa_block(layer, w, st.kc[di], st.vc[di], st.pos_dev, b, R, nch,
-                          st.index[di] if st.index is not None else None, host_pos, sparse_np)
+            g = dsa_block(layer, w, main_caches(segs, di, eager), b, R, nch, sparse_np)
     with prof.timed("hc"):
         glue.hc_post(x, x, g, b.post[:R], b.comb[:R])
         h = layer.ffn_hc
@@ -416,25 +454,45 @@ def check_room(w: Weights, st: State, R: int, pos: int | None = None) -> None:
 def stage(w: Weights, st: State, b: Buffers, tokens: Sequence[int]) -> int:
     """Host work before a forward: the token ids into the static device buffer (pinned copy)."""
 
-    R = len(tokens)
+    return stage_streams(w, b, [(st, tokens)])[-1][2]
+
+
+def stage_streams(w: Weights, b: Buffers, windows: Sequence) -> list:
+    """Several streams' windows (state, tokens) into consecutive rows of the static buffer -> segments (state, a0, a1)."""
+
+    segs, ids, a0 = [], [], 0
+    for st, tokens in windows:
+        check_room(w, st, len(tokens))
+        segs.append((st, a0, a0 + len(tokens)))
+        ids.extend(tokens)
+        a0 += len(tokens)
+    R = a0
     if R > b.rows:
         raise ValueError(f"window of {R} rows, buffers hold {b.rows}")
-    check_room(w, st, R)
     b.staged.synchronize()
-    b.ids_host[:R].numpy()[:] = list(tokens)
+    b.ids_host[:R].numpy()[:] = ids
     b.ids[:R].copy_(b.ids_host[:R], non_blocking=True)
     b.staged.record()
-    return R
+    return segs
 
 
 def compute(w: Weights, st: State, b: Buffers, R: int, *, logits: bool = True, nch: int | None = None,
             host_pos: int | None = None, sparse_np: int | None = None):
     """Run capturable GPU work on static buffers and device positions; eager long contexts use host_pos (graphs sparse_np) to select sparse attention."""
 
+    return compute_streams(w, [(st, 0, R)], b, logits=logits, nch=nch, eager=host_pos is not None,
+                           sparse_np=sparse_np)
+
+
+def compute_streams(w: Weights, segs: Sequence, b: Buffers, *, logits: bool = True, nch: int | None = None,
+                    eager: bool = True, sparse_np: int | None = None):
+    """The forward of every segment's rows at once: projections, experts and mixing over all rows, attention and KDA per stream."""
+
     c = w.cfg
+    R = segs[-1][2]
     glue.embed(b.ids[:R], w.embed, c.hidden, c.streams, b.x[:R])
     for layer in w.layers:
-        layer_forward(layer, w, st, b, R, nch, host_pos, sparse_np)
+        layer_forward(layer, w, segs, b, R, nch, eager, sparse_np)
         for slot in b.tap_at.get(layer.index, ()):
             glue.stream_mean(b.x[:R], b.taps[slot][:R])
     glue.stream_mean(b.x[:R], b.hidden[:R])

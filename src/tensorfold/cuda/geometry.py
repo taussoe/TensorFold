@@ -193,7 +193,10 @@ def _indexed_prefill_row(t: dict, world: int, h: int, hk: int, hd: int, nv: int,
             + 12 * streams + 64)
 
 
-def mla_geometry(t: dict, world: int, reserve: int, *, minimum_slots: int = 2560, latent: bool = False) -> Geometry:
+def mla_geometry(t: dict, world: int, reserve: int, *, minimum_slots: int = 2560, latent: bool = False,
+                 sequences: int = 1) -> Geometry:
+    """``sequences``: concurrent streams, each with a cache of ``capacity`` tokens and KDA states of its own."""
+
     linear, attention = layer_counts(t)
     lin = t.get("linear_attn_config") or {}
     heads = int(t["num_attention_heads"]) // world
@@ -223,13 +226,15 @@ def mla_geometry(t: dict, world: int, reserve: int, *, minimum_slots: int = 2560
         scratch = mla_chunk_scratch(t, world, capacity, latent=latent)
         if latent:
             # latent cache; one prompt chunk's latent partials and absorbed rows (the MTP absorbs through the same buffers)
-            cache = count * capacity * lw * 2
+            cache = sequences * count * capacity * lw * 2
             dense = min(capacity, minimum_slots) + PREFILL_ROWS
             scratch += ((dense + 511) // 512) * PREFILL_ROWS * heads * (lw + 2) * 4 + 4 * PREFILL_ROWS * heads * lw
         else:
             cache = count * capacity * heads * (kd + vd) * 2
             scratch += (2 if mtp else 1) * ((capacity + rows + 511) // 512) * rows * heads * (kd + 2) * 4
-        cache += count * (2 * capacity + capacity // 4 + 2) * index * 2
+        cache += sequences * count * (2 * capacity + capacity // 4 + 2) * index * 2
+        if sequences > 1:                # each further stream's KDA states and conv windows
+            cache += (sequences - 1) * linear * (2 * lh * ld * ld * 4 + (conv - 1) * 3 * lh * ld * 2)
         return fixed + cache + scratch
     return Geometry(bytes_at, reserve, minimum_slots)
 

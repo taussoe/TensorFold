@@ -86,7 +86,7 @@ class GlmEngine:
 
     def __init__(self, model_dir: Path, *, rank: int, master: str, port: int, policy: str = DEFAULT_POLICY,
                  drafter: Path | None = None, context: int | None = None, context_explicit: bool | None = None, serial_only: bool = False, comm=None,
-                 prefill_rows: int | None = None) -> None:
+                 prefill_rows: int | None = None, parallel: int = 1) -> None:
         """``comm``: a communicator with ``all_gather`` and ``barrier`` instead of NCCL between two machines (tests)."""
 
         import torch
@@ -113,7 +113,7 @@ class GlmEngine:
 
         self.capacity_plan = admit(model_dir, context if explicit else cfg.dense_limit, explicit, torch,
                                    lambda text: mla_geometry(text, 2, MAX_ROWS, minimum_slots=DENSE_CAPACITY,
-                                                             latent=LATENT),
+                                                             latent=LATENT, sequences=max(1, parallel)),
                                    split_weights(rule), rank=rank, world=2, gather=self._gather_ints,
                                    draft_dir=drafter, draft_geometry=lambda text: draft_geometry(text, 2, MAX_ROWS))
         self.limit = self.capacity_plan["context_window"]
@@ -122,7 +122,7 @@ class GlmEngine:
         # both ranks must run the same calls: refuse to start when they were given different settings
         prefill_rows = PREFILL_ROWS if prefill_rows is None else int(prefill_rows)
         mine = [int(drafter is not None), capacity, int(long_context), int(serial_only), int(LATENT),
-                prefill_rows]
+                prefill_rows, int(parallel)]
         # other conversations' kept prompts get what the window leaves, at most TF_GLM_CACHE_GIB, the same on both ranks
         plan = self.capacity_plan
         wanted = int(float(os.environ.get("TF_GLM_CACHE_GIB", "3")) * 2 ** 30)
@@ -149,6 +149,26 @@ class GlmEngine:
                              "--no-drafts to both for the serial reference")
         self.w = w
         self.drafter = None
+        # ``parallel`` > 1: up to that many requests decoded together (MTP drafts, eager rounds), each with a
+        # ``capacity``-token context of its own
+        self.concurrent = parallel > 1
+        self.multi = self.scheduler = None
+        if self.concurrent:
+            if drafter is not None or not LATENT:
+                raise ValueError("several GLM streams need the latent cache and MTP drafts (--drafter none)")
+            from tensorfold.cuda.scheduler import Scheduler
+
+            from .multi import MultiDecoder
+
+            self.multi = MultiDecoder(w, slots=parallel, capacity=capacity, depth=0 if serial_only else 3, rank=rank,
+                                      share=self._share, long_context=long_context)
+            self.scheduler = Scheduler(self.multi, max_streams=parallel) if rank == 0 else None
+            self.eos = tuple(w.cfg.eos)
+            self.request = threading.local()
+            if rank == 0:
+                print(f"[tensorfold] GLM-5.3-Flash: {parallel} streams of {self.limit} prompt/reply tokens "
+                      f"({self.multi.slot_bytes / 2**30:.2f} GiB a stream), MTP drafts, eager rounds", flush=True)
+            return
         if drafter is not None:
             from .dflash2 import Drafter
 
@@ -416,6 +436,13 @@ class GlmEngine:
         if len(prompt) >= self.limit:
             raise ValueError(f"prompt of {len(prompt)} tokens: this engine serves contexts up to {self.limit}")
         max_tokens = max(1, min(int(max_tokens), self.limit - len(prompt)))
+        if self.concurrent:
+            spec = getattr(self.request, "policy", None)
+            serial = not draft or self.serial_only or spec == "0"
+            stats = self.scheduler.submit(list(prompt), max_tokens, sampling, not serial, on_tokens,
+                                          stop_eos=bool(getattr(self.request, "stop_eos", True)))
+            stats.update(policy="0" if serial else "mtp", drafts=not serial)
+            return stats
         if not draft or self.serial_only:
             spec = "0"
         else:
@@ -438,6 +465,10 @@ class GlmEngine:
         """Rank 1: mirror every request rank 0 serves, forever."""
 
         from tensorfold.engine.exact_sampling import Sampling
+
+        if self.concurrent:
+            self.multi.follow()
+            return
 
         while True:
             max_tokens, stop_eos, draft, cached, s_lo, s_hi, s_top, t_lo, t_hi, top_k, p_lo, p_hi, *code = \

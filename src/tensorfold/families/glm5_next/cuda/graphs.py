@@ -43,6 +43,7 @@ class Graphs:
             st.cur = saved
             if w.mtp is not None:
                 e.mbuf.zero_first = False
+                e.mbuf.zero_rows = []
                 for n in mtp_rows:
                     for _ in range(2):
                         mtp_compute(w, st, e.mbuf, n)
