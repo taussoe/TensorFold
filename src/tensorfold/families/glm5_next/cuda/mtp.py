@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Sequence
 
+import numpy as np
 import torch
 
 from . import glue, qmm
@@ -31,7 +32,9 @@ def mtp_stage_streams(w: Weights, b: Buffers, windows) -> list:
     b.zero_rows = zero
     b.zero_first = bool(zero) and zero[0] == 0
     b.staged.synchronize()
-    b.ids_host[:a0].numpy()[:] = ids
+    host = b.ids_host[:a0].numpy()
+    host[:] = ids
+    np.copyto(host, w.cfg.image_token, where=host < 0)
     b.ids[:a0].copy_(b.ids_host[:a0], non_blocking=True)
     for (st, tokens, hidden), (_, s0, s1) in zip(windows, segs):
         if hidden.data_ptr() != b.hin[s0:s1].data_ptr():
@@ -65,6 +68,9 @@ def mtp_compute_streams(w: Weights, segs, b: Buffers, *, last: list[int] | None 
     glue.embed(b.ids[:n], w.embed, D, 1, b.me[:n])
     for r in b.zero_rows:
         b.me[r].zero_()
+    if b.overlay is not None:
+        rows, emb = b.overlay
+        b.me[rows] = emb
     glue.rmsnorm(b.me[:n], m.enorm, c.eps, b.mcat[:n, :D])
     glue.rmsnorm(b.hin[:n], m.hnorm, c.eps, b.mcat[:n, D:])
     mm(b, b.mcat[:n], m.eh, None if b.prefill else qmm.group_sums(b.mcat[:n], b.mxs[:n]), b.mx[:n])

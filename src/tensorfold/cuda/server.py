@@ -348,11 +348,15 @@ class App:
         def generate(ids: list[int], count: int, feed: Callable[[list[int]], bool]) -> Any:
             extra = dict(options)
             if prepared.vision is not None:          # a gate's continuation keeps the images, positions extended
-                from tensorfold.vision.qwen_processing import continued
-
                 same = list(ids) == list(prepared.vision.token_ids)
-                extra["vision"] = prepared.vision if same else continued(prepared.vision, ids,
-                                                                       self.vision.frontend.config)
+                if same:
+                    extra["vision"] = prepared.vision
+                elif hasattr(self.vision, "continued"):      # a frontend that continues its own prompts (GLM)
+                    extra["vision"] = self.vision.continued(prepared.vision, ids)
+                else:
+                    from tensorfold.vision.qwen_processing import continued
+
+                    extra["vision"] = continued(prepared.vision, ids, self.vision.frontend.config)
             return self.engine.generate(ids, count, sampling, feed, **extra)
 
         # an engine that decodes concurrent requests together (``concurrent``) takes them as they come

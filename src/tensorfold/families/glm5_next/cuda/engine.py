@@ -96,7 +96,8 @@ class GlmEngine:
         from .weights import Config, load
         from .split import rule
         from tensorfold.cuda.capacity import admit
-        from tensorfold.cuda.geometry import PREFILL_ROWS, draft_geometry, mla_geometry, split_weights
+        from tensorfold.cuda.geometry import PREFILL_ROWS, draft_geometry, mla_geometry, split_weights, with_fixed
+        from . import vision
 
         encode_policy(policy)                           # a bad default fails here, not in the first request
         torch.cuda.set_device(0)
@@ -111,9 +112,13 @@ class GlmEngine:
         explicit = context is not None if context_explicit is None else bool(context_explicit)
         from . import LATENT
 
+        # rank 0 encodes images (its folder holds the vision tower): the tower and its largest image's scratch
+        sees = rank == 0 and os.environ.get("TF_GLM_VISION", "1") != "0" and vision.available(model_dir)
+        seeing = vision.tower_bytes(model_dir) + vision.WORKSPACE if sees else 0
         self.capacity_plan = admit(model_dir, context if explicit else cfg.dense_limit, explicit, torch,
-                                   lambda text: mla_geometry(text, 2, MAX_ROWS, minimum_slots=DENSE_CAPACITY,
-                                                             latent=LATENT, sequences=max(1, parallel)),
+                                   lambda text: with_fixed(mla_geometry(text, 2, MAX_ROWS, minimum_slots=DENSE_CAPACITY,
+                                                                        latent=LATENT, sequences=max(1, parallel)),
+                                                           seeing),
                                    split_weights(rule), rank=rank, world=2, gather=self._gather_ints,
                                    draft_dir=drafter, draft_geometry=lambda text: draft_geometry(text, 2, MAX_ROWS))
         self.limit = self.capacity_plan["context_window"]
@@ -148,6 +153,11 @@ class GlmEngine:
                              "would decode one token: pull the draft model on both machines (--drafter), or pass "
                              "--no-drafts to both for the serial reference")
         self.w = w
+        self.tower = vision.Tower(model_dir) if sees else None
+        if rank == 0:
+            print("[tensorfold] GLM-5.3-Flash image input: " + ("on (vision tower on rank 0)" if sees else
+                  "off (" + ("TF_GLM_VISION=0" if os.environ.get("TF_GLM_VISION", "1") == "0" else
+                             f"no vision tower in {model_dir}") + ")"), flush=True)
         self.drafter = None
         # ``parallel`` > 1: up to that many requests decoded together (MTP drafts, eager rounds), each with a
         # ``capacity``-token context of its own
@@ -373,8 +383,45 @@ class GlmEngine:
 
         return sum(snapshot_bytes(c) for c in self.cache)
 
+    @staticmethod
+    def _image_starts(prompt: list[int], images) -> list[int]:
+        """Where each image's keyed run begins; refuses a prompt whose runs are not the request's images."""
+
+        import numpy as np
+
+        ids = np.asarray(prompt, dtype=np.int64)
+        starts = [int(i) for i in np.flatnonzero(ids < 0) if i == 0 or ids[i - 1] != ids[i]]
+        if len(starts) != len(images or ()):
+            raise ValueError(f"the prompt holds {len(starts)} image runs for {len(images or ())} images")
+        for a, image in zip(starts, images or ()):
+            end = a + image.tokens
+            if end > len(ids) or (ids[a:end] != image.key).any() or (end < len(ids) and ids[end] == image.key):
+                raise ValueError("an image's placeholder tokens do not match the image")
+        return starts
+
+    def _image_rows(self, prompt: list[int], cut: int, images) -> tuple | None:
+        """The rows of the images a prefill from ``cut`` reads (rank 0 encodes them, rank 1 receives them)."""
+
+        import numpy as np
+
+        torch = self.torch
+        ids = np.asarray(prompt, dtype=np.int64)
+        pos = np.flatnonzero(ids[cut:] < 0) + cut
+        if not pos.size:
+            return None
+        D = self.w.cfg.hidden
+        if self.rank == 0:
+            parts = [self.tower.encode(image)[max(a, cut) - a:]
+                     for a, image in zip(self._image_starts(prompt, images), images) if a + image.tokens > cut]
+            mine = torch.cat(parts).contiguous()
+        else:
+            mine = torch.zeros((pos.size, D), dtype=torch.bfloat16, device="cuda")
+        got = torch.empty((2 * pos.size * D,), dtype=torch.bfloat16, device="cuda")
+        self.comm.all_gather(mine.view(-1), got)
+        return pos, got[:pos.size * D].view(pos.size, D)
+
     def _run(self, prompt: list[int], max_tokens: int, sampling, stop_eos: bool, on_tokens: Callable[[list[int]], Any],
-             code: list[int], hit, draft: bool) -> dict[str, Any]:
+             code: list[int], hit, draft: bool, images=None) -> dict[str, Any]:
         from .decode import DepthPolicy, dflash_decode, mtp_decode, prefill, serial_decode, take_snapshot
         from .drafter_choice import DrafterChoice, auto_decode
 
@@ -390,7 +437,11 @@ class GlmEngine:
             load_rows(self.e, hit)
             hit.rows, hit.nbytes = None, 0            # live again
         self.live = list(prompt)
-        first = prefill(self.e, prompt, sampling, mtp=use_mtp, drafter=drafter, resume=hit)
+        self.e.images = self._image_rows(prompt, cut, images)
+        try:
+            first = prefill(self.e, prompt, sampling, mtp=use_mtp, drafter=drafter, resume=hit)
+        finally:
+            self.e.images = None
         prefill_s = time.perf_counter() - t0
         if draft:
             self._remember(take_snapshot(self.e, prompt, self.e.last_hidden if use_mtp else None, mtp=use_mtp,
@@ -430,12 +481,21 @@ class GlmEngine:
             stats["stages_ms"] = {k: round(v * 1e3, 1) for k, v in res.stages.items()}
         return stats
 
-    def generate(self, prompt: list[int], max_tokens: int, sampling, on_tokens, draft: bool = True) -> dict[str, Any]:
-        """Mirror one rank-0 request on rank 1; draft=False uses serial decoding and fresh prefill as the reference drafted replies must equal."""
+    def generate(self, prompt: list[int], max_tokens: int, sampling, on_tokens, draft: bool = True,
+                 vision=None) -> dict[str, Any]:
+        """Mirror one rank-0 request on rank 1; draft=False uses serial decoding and fresh prefill as the reference drafted replies must equal.
+
+        ``vision``: the frontend's ``vision.Prepared`` for a prompt with images (their keyed runs), else None.
+        """
 
         if len(prompt) >= self.limit:
             raise ValueError(f"prompt of {len(prompt)} tokens: this engine serves contexts up to {self.limit}")
         max_tokens = max(1, min(int(max_tokens), self.limit - len(prompt)))
+        images = vision.images if vision is not None else None
+        if images and (self.tower is None or self.concurrent):
+            raise ValueError("this server reads text only: image input needs the vision tower on rank 0 "
+                             "(see the startup log) and one stream (no --parallel)")
+        self._image_starts(prompt, images)          # before rank 1 is told of the request
         if self.concurrent:
             spec = getattr(self.request, "policy", None)
             serial = not draft or self.serial_only or spec == "0"
@@ -457,7 +517,7 @@ class GlmEngine:
                   *_f64_ints(sampling.top_p if sampling else 1.0)] + code
         self._share(header)
         self._share(list(prompt))
-        stats = self._run(list(prompt), max_tokens, sampling, stop_eos, on_tokens, code, hit, draft)
+        stats = self._run(list(prompt), max_tokens, sampling, stop_eos, on_tokens, code, hit, draft, images)
         stats.update(policy=spec, drafts=draft)
         return stats
 

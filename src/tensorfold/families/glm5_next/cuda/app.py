@@ -13,8 +13,9 @@ class ThinkingOffTemplate:
     def __init__(self, inner) -> None:
         self.inner = inner
 
-    def render(self, messages, *, tools, enable_thinking, extra=None) -> str:
-        text = self.inner.render(messages, tools=tools, enable_thinking=enable_thinking, extra=extra)
+    def render(self, messages, *, tools, enable_thinking, extra=None, allow_images=False) -> str:
+        text = self.inner.render(messages, tools=tools, enable_thinking=enable_thinking, extra=extra,
+                                 allow_images=allow_images)
         if not enable_thinking:
             text = text.replace("<|system|>Reasoning Effort: Max", "", 1)
             if text.endswith("<|assistant|><think>"):
@@ -28,6 +29,10 @@ class GlmApp(App):
     def __init__(self, engine, model_dir, served: str, **kwargs: Any) -> None:
         super().__init__(engine, model_dir, served, **kwargs)
         self.template = ThinkingOffTemplate(self.template)
+        if getattr(engine, "tower", None) is not None and not getattr(engine, "concurrent", False):
+            from .vision import Frontend        # images: each placeholder becomes its keyed run
+
+            self.vision = Frontend(self.tok, engine.w.cfg.image_token)
 
     def check(self, body: dict[str, Any], *, prepared: PreparedRequest | None = None) -> str | None:
         """Validate the rendered prompt plus max_tokens against the engine context limit before streaming."""

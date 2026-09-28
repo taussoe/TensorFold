@@ -78,6 +78,8 @@ PREFILL_ROWS = 2048      # rows of a prompt chunk
 class Engine:
     """Weights, one sequence's state, buffers for decode windows (main model and MTP head) and for prompt chunks."""
 
+    images = None       # this prompt's image rows: (positions, rows [n, D] bf16), set around a prefill
+
     def __init__(self, w: Weights, *, capacity: int = 2560, max_rows: int = 8, prefill_rows: int = PREFILL_ROWS,
                  graphs: bool = False, graph_rows: tuple[int, ...] = (1, 2, 3, 4), long_context: bool = False,
                  taps: tuple[int, ...] = ()) -> None:
@@ -103,6 +105,18 @@ class Engine:
 
     def reset(self) -> None:
         self.st.reset()
+
+    def overlay(self, first: int, n: int):
+        """The image rows among prompt positions [first, first + n): (row indices, their rows), or None."""
+
+        if self.images is None:
+            return None
+        pos, rows = self.images
+        lo, hi = np.searchsorted(pos, first), np.searchsorted(pos, first + n)
+        if lo == hi:
+            return None
+        idx = torch.from_numpy(pos[lo:hi] - first).to(rows.device, non_blocking=True)
+        return idx, rows[lo:hi]
 
     def forward(self, tokens: Sequence[int]) -> torch.Tensor:
         """A step's forward (a CUDA graph when one was captured for its shape): logits [R, V/world]."""
@@ -311,13 +325,17 @@ def prefill(e: Engine, prompt: Sequence[int], sampling: Sampling | None, *, mtp:
         restore(e, resume, drafter)
         if use_mtp:
             k = resume.pending.shape[0]
+            b.overlay = e.overlay(begin - k + 1, k)
             _absorb_rows(e, resume.pending, list(prompt[begin - k + 1:begin + 1]))
+            b.overlay = None
     last = None
     prof.active = True
     for start in range(begin, len(prompt), e.prefill_rows):
         chunk = list(prompt[start:start + e.prefill_rows])
         R = len(chunk)
+        b.overlay = e.overlay(start, R)
         last = compute(w, st, b, stage(w, st, b, chunk), nch=chunks_for(st, R), host_pos=st.pos).clone()
+        b.overlay = None
         e.last_hidden = b.fnormed[R - 1:R].clone()
         if drafter is not None:
             drafter.add_taps(e.tap_rows(R, b))
@@ -325,7 +343,9 @@ def prefill(e: Engine, prompt: Sequence[int], sampling: Sampling | None, *, mtp:
             nxt = list(prompt[start + 1:start + R + 1])
             if nxt:
                 with prof.timed("mtp absorb"):
+                    b.overlay = e.overlay(start + 1, len(nxt))
                     _absorb_rows(e, b.fnormed[:len(nxt)], nxt)
+                    b.overlay = None
         with prof.timed("commit"):
             commit(w, st, b, R, R)
     prof.active = False

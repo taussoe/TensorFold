@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Sequence
 
+import numpy as np
 import torch
 import triton
 import triton.language as tl
@@ -47,6 +48,7 @@ class Buffers:
         self.hin = torch.empty((rows, c.hidden), dtype=torch.bfloat16, device=dev)      # MTP input rows
         self.zero_first = False          # MTP: this step starts at position 0 (its embedding is zeroed)
         self.zero_rows: list[int] = []   # MTP rows at position 0 (their embeddings are zeroed)
+        self.overlay = None              # prompt chunks: (rows, image rows) replacing those rows' embeddings (eager)
         self.x = torch.empty((rows, S * D), dtype=bf, device=dev)
         self.normed = torch.empty((rows, D), dtype=bf, device=dev)
         self.xs = torch.empty((rows, D // 64), dtype=f32, device=dev)
@@ -470,7 +472,9 @@ def stage_streams(w: Weights, b: Buffers, windows: Sequence) -> list:
     if R > b.rows:
         raise ValueError(f"window of {R} rows, buffers hold {b.rows}")
     b.staged.synchronize()
-    b.ids_host[:R].numpy()[:] = ids
+    host = b.ids_host[:R].numpy()
+    host[:] = ids
+    np.copyto(host, w.cfg.image_token, where=host < 0)         # an image's keyed rows embed its placeholder
     b.ids[:R].copy_(b.ids_host[:R], non_blocking=True)
     b.staged.record()
     return segs
@@ -491,6 +495,9 @@ def compute_streams(w: Weights, segs: Sequence, b: Buffers, *, logits: bool = Tr
     c = w.cfg
     R = segs[-1][2]
     glue.embed(b.ids[:R], w.embed, c.hidden, c.streams, b.x[:R])
+    if b.overlay is not None:
+        rows, emb = b.overlay
+        b.x[:R].view(R, c.streams, c.hidden)[rows] = emb[:, None, :].expand(-1, c.streams, -1)
     for layer in w.layers:
         layer_forward(layer, w, segs, b, R, nch, eager, sparse_np)
         for slot in b.tap_at.get(layer.index, ()):

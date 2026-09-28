@@ -220,6 +220,10 @@ def main(argv: list[str] | None = None) -> int:
         if (args.out / f"{stem}.rank{args.rank}.safetensors").exists():
             continue
         print(src.name, split_file(src, args.out, args.rank), flush=True)
+    if args.rank == 0 and not (args.out / "vision.safetensors").exists():    # rank 0 encodes the images
+        from .vision import write_vision
+
+        print(f"vision tower: {write_vision(args.model_dir, args.out)} tensors", flush=True)
     print(f"rank {args.rank}'s share of {len(files)} files in {args.out}", flush=True)
     return 0
 

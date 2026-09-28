@@ -55,6 +55,7 @@ class Config:
     group_size: int
     bits: int
     quant: str = "mlx"         # "mlx" (affine 4-bit everywhere) or "exl3" (EXL3 routed experts, BF16 elsewhere)
+    image_token: int = 154854  # an image's placeholder (the engine keys it by image: negative ids, ``vision.Image.key``)
 
     @classmethod
     def read(cls, model_dir: str | Path) -> "Config":
@@ -88,6 +89,7 @@ class Config:
             limit=float(t.get("swiglu_limit", 10.0)), kinds=kinds, mlp_kinds=mlp_kinds, eos=eos,
             mtp_layers=int(t.get("num_nextn_predict_layers", 0)), group_size=int(quant.get("group_size", 64)),
             bits=int(quant.get("bits", 4)), quant=str(quant.get("quant_method") or "mlx").lower(),
+            image_token=int(raw.get("image_token_id", 154854)),
         )
 
     @property
