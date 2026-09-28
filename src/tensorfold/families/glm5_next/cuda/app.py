@@ -7,6 +7,28 @@ from typing import Any, Callable
 from tensorfold.cuda.server import App, PreparedRequest, RequestError
 
 
+# OpenAI reasoning_effort -> GLM-5.3's template levels (it knows low and high; anything else renders as max)
+EFFORTS = {"minimal": "low", "low": "low", "medium": "high", "high": "high", "xhigh": "max", "max": "max"}
+
+
+def with_effort(body: dict[str, Any]) -> dict[str, Any]:
+    """The request with its ``reasoning_effort`` as template kwargs: "none" turns thinking off, a level picks the
+    template's Reasoning Effort line; explicit chat_template_kwargs win. Without it the template thinks at max."""
+
+    effort = body.get("reasoning_effort")
+    if not isinstance(effort, str):
+        return body
+    effort = effort.strip().lower()
+    kwargs = dict(body.get("chat_template_kwargs") or {})
+    if effort == "none":
+        kwargs.setdefault("enable_thinking", False)
+    elif effort in EFFORTS:
+        kwargs.setdefault("reasoning_effort", EFFORTS[effort])
+    else:
+        return body
+    return {**body, "chat_template_kwargs": kwargs}
+
+
 class ThinkingOffTemplate:
     """The checkpoint's chat template, rendered as GLM-5.3's thinking-off template renders it when thinking is off."""
 
@@ -33,6 +55,9 @@ class GlmApp(App):
             from .vision import Frontend        # images: each placeholder becomes its keyed run
 
             self.vision = Frontend(self.tok, engine.w.cfg.image_token)
+
+    def _prepare(self, body: dict[str, Any], chat: bool) -> PreparedRequest:
+        return super()._prepare(with_effort(body), chat)
 
     def check(self, body: dict[str, Any], *, prepared: PreparedRequest | None = None) -> str | None:
         """Validate the rendered prompt plus max_tokens against the engine context limit before streaming."""
