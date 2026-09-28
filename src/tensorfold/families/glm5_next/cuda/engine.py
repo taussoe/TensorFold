@@ -154,6 +154,7 @@ class GlmEngine:
                              "--no-drafts to both for the serial reference")
         self.w = w
         self.tower = vision.Tower(model_dir) if sees else None
+        self.disk = None                 # kept prompts on disk (TF_GLM_DISK_DIR, one stream only; set below)
         if rank == 0:
             print("[tensorfold] GLM-5.3-Flash image input: " + ("on (vision tower on rank 0)" if sees else
                   "off (" + ("TF_GLM_VISION=0" if os.environ.get("TF_GLM_VISION", "1") == "0" else
@@ -200,6 +201,20 @@ class GlmEngine:
         self.cache: list = []
         self.live: list[int] = []
         self.cache_entries = int(os.environ.get("TF_GLM_CACHE_ENTRIES", "8"))
+        # TF_GLM_DISK_DIR: every prompt's rows also go to disk (the rows it adds to its longest written prefix), so a
+        # conversation that left the device, or one from before a restart, resumes from there; TF_GLM_DISK_GIB caps it
+        self.disk = None
+        folder = os.environ.get("TF_GLM_DISK_DIR")
+        if folder:
+            from .disk import Store, fingerprint
+
+            stamp = fingerprint(model_dir, rank, 2, {"latent": int(latent.ENABLED), "prefill_rows": prefill_rows,
+                                                     "long_context": int(long_context)})
+            self.disk = Store(Path(folder) / f"rank{rank}", float(os.environ.get("TF_GLM_DISK_GIB", "64")) * 2 ** 30,
+                              stamp)
+            if rank == 0:
+                print(f"[tensorfold] kept prompts on disk: {len(self.disk.entries)} in {folder} "
+                      f"({self.disk.held() / 2 ** 30:.1f} of {self.disk.budget / 2 ** 30:.0f} GiB)", flush=True)
 
     def _calibrate(self) -> dict:
         """Per-piece ms for ``drafter_choice.DrafterChoice``: fastest of interleaved passes, equal on both ranks."""
@@ -315,7 +330,8 @@ class GlmEngine:
         return auto, auto or not dflash, dflash
 
     def _resume(self, prompt: list[int], code: list[int]):
-        """The longest snapshot of a strict prefix of ``prompt`` whose draft caches fit the request's drafters."""
+        """The longest snapshot of a strict prefix of ``prompt`` whose draft caches fit the request's drafters: kept
+        on the device, else written to disk (a stand-in ``Store.load`` fills)."""
 
         _, mtp, dflash = self._drafters(code)
         best = None
@@ -324,6 +340,10 @@ class GlmEngine:
             if fits and len(snap.ids) < len(prompt) and prompt[:len(snap.ids)] == snap.ids and (
                     best is None or len(snap.ids) > len(best.ids)):
                 best = snap
+        if self.disk is not None and not dflash:
+            entry = self.disk.resume(prompt, mtp=mtp)
+            if entry is not None and (best is None or len(entry.ids) > len(best.ids)):
+                return entry.stub()
         return best
 
     def _drop(self, snap) -> None:
@@ -357,6 +377,9 @@ class GlmEngine:
         for snap in list(self.cache):
             n = len(snap.ids)
             if snap not in self.cache or snap.rows is not None or resumes(snap):
+                continue
+            if self.disk is not None and self.disk.has(snap.ids):      # it resumes from disk: nothing to save
+                self.cache.remove(snap)
                 continue
             if live[:n] != snap.ids:                  # its rows are already gone: nothing to resume from
                 self._drop(snap)
@@ -421,10 +444,14 @@ class GlmEngine:
         return pos, got[:pos.size * D].view(pos.size, D)
 
     def _run(self, prompt: list[int], max_tokens: int, sampling, stop_eos: bool, on_tokens: Callable[[list[int]], Any],
-             code: list[int], hit, draft: bool, images=None) -> dict[str, Any]:
+             code: list[int], hit, draft: bool, images=None, resuming: bool = False) -> dict[str, Any]:
         from .decode import DepthPolicy, dflash_decode, mtp_decode, prefill, serial_decode, take_snapshot
         from .drafter_choice import DrafterChoice, auto_decode
 
+        if resuming:                                  # both ranks resume, or neither does (a rank lost its copy)
+            both = self._gather_ints([int(hit is not None)])
+            if not (both[0][0] and both[1][0]):
+                hit = None
         auto, use_mtp, use_dflash = self._drafters(code)
         drafter = self.drafter if use_dflash else None
         t0 = time.perf_counter()
@@ -433,7 +460,9 @@ class GlmEngine:
 
         cut = len(hit.ids) if hit is not None else 0
         self._take_over(list(hit.ids) if hit is not None else [])
-        if hit is not None and hit.rows is not None:
+        if hit is not None and getattr(hit, "disk", None) is not None:
+            hit = self.disk.load(self.e, hit.disk)    # its rows straight into the live caches
+        elif hit is not None and hit.rows is not None:
             load_rows(self.e, hit)
             hit.rows, hit.nbytes = None, 0            # live again
         self.live = list(prompt)
@@ -443,12 +472,15 @@ class GlmEngine:
         finally:
             self.e.images = None
         prefill_s = time.perf_counter() - t0
+        snap = None
         if draft:
-            self._remember(take_snapshot(self.e, prompt, self.e.last_hidden if use_mtp else None, mtp=use_mtp,
-                                         drafter=drafter))
+            snap = take_snapshot(self.e, prompt, self.e.last_hidden if use_mtp else None, mtp=use_mtp,
+                                 drafter=drafter)
+            self._remember(snap)
         stats: dict[str, Any] = {"prefill_s": prefill_s, "cached": cut}
         on_tokens([first])
         if max_tokens <= 1 or (stop_eos and first in self.eos):
+            self._write(snap)
             return stats
         policy = decode_policy(code)
         if policy is None:
@@ -479,7 +511,14 @@ class GlmEngine:
             stats.update(drafters=res.arms, keeps=res.keeps)
         if res.stages:
             stats["stages_ms"] = {k: round(v * 1e3, 1) for k, v in res.stages.items()}
+        self._write(snap)
         return stats
+
+    def _write(self, snap) -> None:
+        """The prompt's rows to disk once its reply is out (decoding writes only past the prompt, so they are intact)."""
+
+        if self.disk is not None and snap is not None:
+            self.disk.put(self.e, snap)
 
     def generate(self, prompt: list[int], max_tokens: int, sampling, on_tokens, draft: bool = True,
                  vision=None) -> dict[str, Any]:
@@ -517,7 +556,8 @@ class GlmEngine:
                   *_f64_ints(sampling.top_p if sampling else 1.0)] + code
         self._share(header)
         self._share(list(prompt))
-        stats = self._run(list(prompt), max_tokens, sampling, stop_eos, on_tokens, code, hit, draft, images)
+        stats = self._run(list(prompt), max_tokens, sampling, stop_eos, on_tokens, code, hit, draft, images,
+                          resuming=hit is not None)
         stats.update(policy=spec, drafts=draft)
         return stats
 
@@ -540,6 +580,9 @@ class GlmEngine:
             hit = None
             if cached:
                 hit = next((c for c in self.cache if len(c.ids) == cached and prompt[:cached] == c.ids), None)
-                if hit is None:
-                    raise RuntimeError(f"rank 1 has no snapshot of the {cached} tokens rank 0 resumes from")
-            self._run(prompt, max_tokens, sampling, bool(stop_eos), lambda new: None, code, hit, bool(draft))
+                if hit is None and self.disk is not None:
+                    entry = self.disk.find(prompt[:cached])
+                    hit = entry.stub() if entry is not None else None
+                # without it both ranks prefill afresh (``_run`` agrees on it)
+            self._run(prompt, max_tokens, sampling, bool(stop_eos), lambda new: None, code, hit, bool(draft),
+                      resuming=bool(cached))
