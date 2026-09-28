@@ -123,6 +123,11 @@ def test_a_prompt_resumes_from_the_last_checkpoint_before_it_leaves_another(mode
     first = shared + _ids(32, 40)
     _generate(e, first, SAMPLING, tokens=8)
     assert {len(x.ids) for x in e.disk.entries.values()} >= {16, 32, 48, len(first)}
+    e.checkpoint_after = lambda pos: (pos // 64 + 1) * 64             # on a chunk's own end (32-row chunks)
+    aligned = _ids(35, 150)
+    _generate(e, aligned, SAMPLING, tokens=8)
+    assert {64, 128} <= {len(x.ids) for x in e.disk.entries.values()}
+    e.checkpoint_after = lambda pos: (pos // 16 + 1) * 16
     _forget(e)
     other = shared + _ids(33, 30)                      # parts from ``first`` at token 50
     warm, stats = _generate(e, other, SAMPLING)

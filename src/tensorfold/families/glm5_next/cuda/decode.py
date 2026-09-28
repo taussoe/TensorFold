@@ -338,7 +338,7 @@ def prefill(e: Engine, prompt: Sequence[int], sampling: Sampling | None, *, mtp:
     while start < len(prompt):
         end = min(start + e.prefill_rows, len(prompt))
         at = mark(start) if mark is not None else None
-        point = at is not None and start < at < end
+        point = at is not None and start < at <= end and at < len(prompt)
         if point:
             end = at
         chunk = list(prompt[start:end])
