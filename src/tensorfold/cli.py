@@ -332,6 +332,16 @@ def _backend(choice: str, family: Any) -> str:
     return backend
 
 
+def _freeze_startup_objects() -> None:
+    """Keep the loaded engine's objects out of the garbage collector's full passes: with them, a pass over the
+    process took ~1.4 s in the middle of a request every few dozen requests (on both ranks, so rank 0 waited)."""
+
+    import gc
+
+    gc.collect()
+    gc.freeze()
+
+
 def _serve_cuda(args: argparse.Namespace, family: Any, model_dir: Path, context: int | None = None) -> int:
     """Serve with the family's CUDA engine (``cuda_engine``) behind ``tensorfold.cuda.server``."""
 
@@ -364,6 +374,7 @@ def _serve_cuda(args: argparse.Namespace, family: Any, model_dir: Path, context:
     print(f"[tensorfold] loading {served}: {family.title} ({family.model_type}) on CUDA{where}", flush=True)
     engine = family.package.cuda_engine(model_dir, **options)
     stacks.arm()            # its warmup may have loaded a compiler that took USR1
+    _freeze_startup_objects()
     if args.tp == 2 and args.rank == 1:
         print(f"[tensorfold] rank 1 ready in {time.perf_counter() - started:.1f}s, following rank 0", flush=True)
         engine.follow()
