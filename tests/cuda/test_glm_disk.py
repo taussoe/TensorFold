@@ -23,14 +23,13 @@ SAMPLING = Sampling(99, 1.0, 20, 0.95)
 def _engine(path, disk, rows="32"):
     from tensorfold.families.glm5_next.cuda.engine import GlmEngine
 
-    saved = {k: os.environ.get(k) for k in ("TF_GLM_PREFILL_ROWS", "TF_GLM_DISK_DIR")}
-    os.environ["TF_GLM_PREFILL_ROWS"] = rows
+    saved = {k: os.environ.get(k) for k in ("TF_GLM_DISK_DIR",)}
     if disk is None:
         os.environ.pop("TF_GLM_DISK_DIR", None)
     else:
         os.environ["TF_GLM_DISK_DIR"] = str(disk)
     try:
-        return GlmEngine(path, rank=0, master="", port=0, comm=_TwoCopies())
+        return GlmEngine(path, rank=0, master="", port=0, comm=_TwoCopies(), prefill_rows=int(rows))
     finally:
         for k, v in saved.items():
             if v is None:

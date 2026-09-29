@@ -217,7 +217,7 @@ class GlmEngine:
         if folder:
             from .disk import Store, fingerprint
 
-            stamp = fingerprint(model_dir, rank, 2, {"latent": int(latent.ENABLED), "prefill_rows": prefill_rows,
+            stamp = fingerprint(model_dir, rank, 2, {"latent": int(LATENT), "prefill_rows": prefill_rows,
                                                      "long_context": int(long_context)})
             self.disk = Store(Path(folder) / f"rank{rank}", float(os.environ.get("TF_GLM_DISK_GIB", "64")) * 2 ** 30,
                               stamp)

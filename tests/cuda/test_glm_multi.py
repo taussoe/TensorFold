@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 
 import numpy as np
 import pytest
@@ -25,15 +24,7 @@ def engine(tmp_path_factory):
 
     path = tmp_path_factory.mktemp("glm_multi")
     _checkpoint(path)
-    saved = os.environ.get("TF_GLM_PREFILL_ROWS")
-    os.environ["TF_GLM_PREFILL_ROWS"] = "256"
-    try:
-        return GlmEngine(path, rank=0, master="", port=0, comm=_TwoCopies(), context=CONTEXT)
-    finally:
-        if saved is None:
-            os.environ.pop("TF_GLM_PREFILL_ROWS", None)
-        else:
-            os.environ["TF_GLM_PREFILL_ROWS"] = saved
+    return GlmEngine(path, rank=0, master="", port=0, comm=_TwoCopies(), context=CONTEXT, prefill_rows=256)
 
 
 def _prompt(seed, n):
