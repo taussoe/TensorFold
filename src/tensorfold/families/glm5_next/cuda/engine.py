@@ -511,7 +511,7 @@ class GlmEngine:
         stats: dict[str, Any] = {"prefill_s": prefill_s, "cached": cut}
         on_tokens([first])
         if max_tokens <= 1 or (stop_eos and first in self.eos):
-            self._write(snap)
+            self._write(snap, stats)
             return stats
         policy = decode_policy(code)
         if policy is None:
@@ -526,7 +526,9 @@ class GlmEngine:
                                        margin=margin)
             from .lookup import PromptLookup
 
+            t = time.perf_counter()
             lookup = PromptLookup(prompt) if os.environ.get("TF_GLM_LOOKUP", "1") != "0" else None
+            stats["lookup_s"] = time.perf_counter() - t
             res = auto_decode(self.e, drafter, first, max_tokens, sampling, choice=choice, m_policy=m_policy,
                               f_policy=DepthPolicy(5, fixed=True, confidence=0.3), stop_eos=stop_eos,
                               on_tokens=on_tokens, lookup=lookup)
@@ -545,14 +547,17 @@ class GlmEngine:
             stats.update(drafters=res.arms, keeps=res.keeps)
         if res.stages:
             stats["stages_ms"] = {k: round(v * 1e3, 1) for k, v in res.stages.items()}
-        self._write(snap)
+        self._write(snap, stats)
         return stats
 
-    def _write(self, snap) -> None:
+    def _write(self, snap, stats=None) -> None:
         """The prompt's rows to disk once its reply is out (decoding writes only past the prompt, so they are intact)."""
 
         if self.disk is not None and snap is not None:
+            t = time.perf_counter()
             self.disk.put(self.e, snap)
+            if stats is not None:
+                stats["write_s"] = time.perf_counter() - t
 
     def generate(self, prompt: list[int], max_tokens: int, sampling, on_tokens, draft: bool = True,
                  vision=None) -> dict[str, Any]:
@@ -582,7 +587,9 @@ class GlmEngine:
             spec = getattr(self.request, "policy", None) or self.policy
         code = self._effective(encode_policy(spec))
         stop_eos = bool(getattr(self.request, "stop_eos", True))
+        t = time.perf_counter()
         hit = self._resume(list(prompt), code) if draft else None
+        resume_s = time.perf_counter() - t
         seed = (sampling.seed if sampling else 0) & 0xFFFFFFFFFFFFFFFF
         header = [max_tokens, int(stop_eos), int(draft), len(hit.ids) if hit is not None else 0,
                   seed & 0x7FFFFFFF, (seed >> 31) & 0x7FFFFFFF, seed >> 62,
@@ -592,7 +599,7 @@ class GlmEngine:
         self._share(list(prompt))
         stats = self._run(list(prompt), max_tokens, sampling, stop_eos, on_tokens, code, hit, draft, images,
                           resuming=hit is not None)
-        stats.update(policy=spec, drafts=draft)
+        stats.update(policy=spec, drafts=draft, resume_s=resume_s)
         return stats
 
     def follow(self) -> None:

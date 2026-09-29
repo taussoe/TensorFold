@@ -63,8 +63,20 @@ _DT = {torch.bfloat16: "bf16", torch.float32: "f32", torch.int32: "i32", torch.f
 _TD = {v: k for k, v in _DT.items()}
 
 
+STAGE = 64 * 2 ** 20        # a pinned host buffer, reused: fresh 68 MB host copies each request faulted in pages at 0.6 s
+_staging: dict = {}
+
+
+def _stage() -> torch.Tensor:
+    buf = _staging.get("buf")
+    if buf is None:
+        buf = torch.empty(STAGE, dtype=torch.uint8, pin_memory=torch.cuda.is_available())
+        _staging["buf"] = buf
+    return buf
+
+
 def _write(path: Path, meta: dict, tensors: list[tuple[str, torch.Tensor]]) -> int:
-    """A file of ``meta`` and raw tensors (rows copied to the host CHUNK bytes at a time); its size."""
+    """A file of ``meta`` and raw tensors, copied to the host STAGE bytes at a time through one reused pinned buffer."""
 
     layout, offset = {}, 0
     for name, t in tensors:
@@ -74,15 +86,21 @@ def _write(path: Path, meta: dict, tensors: list[tuple[str, torch.Tensor]]) -> i
     head = json.dumps({"meta": meta, "tensors": layout}).encode()
     head += b" " * (-len(head) % 64)
     tmp = path.with_suffix(".part")
+    stage = _stage()
+    view = stage.numpy()
     with open(tmp, "wb") as f:
         f.write(len(head).to_bytes(8, "little"))
         f.write(head)
         for _, t in tensors:
-            t = t.contiguous()
-            rows = max(1, CHUNK // max(1, t[0].numel() * t.element_size())) if t.dim() else 1
-            for a in range(0, max(t.shape[0], 1) if t.dim() else 1, rows):
-                part = (t[a:a + rows] if t.dim() else t).cpu()
-                f.write(part.view(torch.uint8).numpy().tobytes() if part.dtype != torch.uint8 else part.numpy().tobytes())
+            if t.numel() == 0:
+                continue
+            flat = t.contiguous().reshape(-1).view(torch.uint8)
+            for a in range(0, flat.numel(), STAGE):
+                k = min(STAGE, flat.numel() - a)
+                stage[:k].copy_(flat[a:a + k], non_blocking=flat.is_cuda)
+                if flat.is_cuda:
+                    torch.cuda.current_stream().synchronize()
+                f.write(memoryview(view[:k]))
         f.flush()
         os.fsync(f.fileno())
         _forget_pages(f.fileno())

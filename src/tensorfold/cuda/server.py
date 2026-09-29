@@ -84,6 +84,7 @@ class PreparedRequest:
     ignore_eos: bool = False
     stop: tuple[str, ...] = ()
     vision: Any = None
+    prepare_s: float = 0.0          # rendering the template, reading images and tokenizing
 
 
 def _native_context(model_dir: Path) -> int:
@@ -276,6 +277,7 @@ class App:
             prepared: PreparedRequest | None = None, cancelled: Callable[[], bool] | None = None) -> dict[str, Any]:
         """One reply; once ``cancelled()`` holds, a waiting request raises ``RequestCancelled`` unstarted, a running one stops at its next round and raises it after ``generate``."""
 
+        t_run = time.perf_counter()
         prepared = prepared if prepared is not None else self.prepare(body, chat)
         prompt, max_tokens = prepared.prompt, prepared.max_tokens
         tools, thinking = prepared.tools, prepared.thinking
@@ -384,9 +386,17 @@ class App:
         s = stats or {}
         prefill_s, decode_s = float(s.get("prefill_s") or 0.0), float(s.get("decode_s") or 0.0)
         rate = f"{(len(out) - 1) / decode_s:.1f} tok/s" if decode_s > 0 and len(out) > 1 else "-"
-        print(f"[tensorfold] request: {len(prompt)} prompt tokens ({int(s.get('cached') or 0)} resumed), prefill "
+        images = getattr(prepared.vision, "images", None)
+        seen = f", {len(images)} images" if images else ", images" if prepared.vision is not None else ""
+        extra = {k: float(s[k]) for k in ("resume_s", "lookup_s", "write_s") if s.get(k)}
+        spent = time.perf_counter() - t_run
+        rest = spent - prefill_s - decode_s - sum(extra.values())
+        timing = (f"; prepare {prepared.prepare_s:.2f}s" + "".join(f", {k[:-2]} {v:.2f}s" for k, v in extra.items()) +
+                  f", other {rest:.2f}s")
+        print(f"[tensorfold] request: {len(prompt)} prompt tokens ({int(s.get('cached') or 0)} resumed{seen}), prefill "
               f"{prefill_s:.1f}s; {len(out)} reply tokens in {decode_s:.1f}s ({rate}), {len(reasoning)} chars of "
-              f"thinking, finish {finish}{', tools ' + ','.join(c['function']['name'] for c in calls) if calls else ''}",
+              f"thinking, finish {finish}{', tools ' + ','.join(c['function']['name'] for c in calls) if calls else ''}"
+              f"{timing}",
               flush=True)
         if body.get("return_token_ids"):              # the reply's ids in the "tensorfold" block, for exactness checks
             stats = {**(stats or {}), "token_ids": [int(t) for t in out]}
@@ -493,7 +503,9 @@ def make_handler(app: App):
             except (json.JSONDecodeError, UnicodeDecodeError):
                 return self._json(400, {"error": {"message": "the request body is not JSON", "type": "invalid_request_error"}})
             try:
+                t_prep = time.perf_counter()
                 prepared = app.prepare(body, chat)
+                prepared.prepare_s = time.perf_counter() - t_prep
             except RequestError as exc:
                 return self._json(503 if isinstance(exc, CapacityError) else 400,
                                   {"error": {"message": str(exc), "type": "invalid_request_error"}})
