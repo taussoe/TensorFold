@@ -92,6 +92,9 @@ def _ints_f64(lo: int, hi: int) -> float:
 class GlmEngine:
     """GLM-5.3-Flash on two ranks (this one ``rank``): weights, MTP and DFlash2 drafting, per-request policies."""
 
+    disk = None          # kept prompts on disk (TF_GLM_DISK_DIR)
+    tower = None         # the vision tower (rank 0)
+
     def __init__(self, model_dir: Path, *, rank: int, master: str, port: int, policy: str = DEFAULT_POLICY,
                  drafter: Path | None = None, context: int | None = None, context_explicit: bool | None = None, serial_only: bool = False, comm=None,
                  prefill_rows: int | None = None, parallel: int = 1) -> None:
@@ -113,6 +116,7 @@ class GlmEngine:
         self.rank = rank
         self.policy = "0" if serial_only else policy
         self.serial_only = serial_only
+        self.own_comm = comm is None                    # NCCL between two machines (else a test's stand-in)
         self.comm = comm if comm is not None else NCCL(rank, 2, master, port)
         self.comm.barrier()
         cfg = Config.read(model_dir)
@@ -229,12 +233,13 @@ class GlmEngine:
         """``admit``; a refusal (both ranks reach the same one) is printed at once and ends the process: unwinding
         with the NCCL communicator open held a refused start for half an hour before its message appeared."""
 
-        from tensorfold.cuda.comm import NCCL
+        from tensorfold.cuda import comm as nccl
 
         try:
             return admit(*args, **kwargs)
         except ValueError as exc:
-            if not isinstance(self.comm, NCCL):     # tests' stand-in communicators unwind as usual
+            real = isinstance(nccl.NCCL, type) and isinstance(self.comm, nccl.NCCL)
+            if not (self.own_comm and real):         # tests' stand-in communicators unwind as usual
                 raise
             print(f"tensorfold: {exc}", flush=True)
             os._exit(1)
