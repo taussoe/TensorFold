@@ -432,7 +432,7 @@ def test_tp_server_ranks_share_requests_and_stream_serial_tokens(checkpoint, mod
     eos = [i for i, t in enumerate(ref) if t in engines[0].eos]
     assert got == (ref[:eos[0] + 1] if eos else ref)
     assert serial == got and serial_stats["drafts"] is False
-    assert warm_stats["cached"] == len(PROMPT) and warm == cold             # the reply prefills again
+    assert warm_stats["cached"] == len(PROMPT) - 1 and warm == cold         # the reply prefills again
     assert len(greedy) >= 1
 
 

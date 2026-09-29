@@ -254,10 +254,10 @@ class FlashNextEngine:
 
         t0 = time.perf_counter()
         self._start_from(hit)
-        first = prefill(self.e, prompt, sampling, resume=hit[1] if hit else None)
-        # the prompt's state: the MTP head has absorbed every position but the last, whose streams resume needs
-        self._remember(list(prompt), {"state": self.e.st.snapshot(),
-                                      "tail": self.e.last_streams.clone() if self.e.mbuf is not None else None})
+        # the state of the prompt but its last token: the MTP head has absorbed every position but that one's last,
+        # whose streams resume needs
+        first = prefill(self.e, prompt, sampling, resume=hit[1] if hit else None,
+                        keep=lambda ids, snap, tail: self._remember(ids, {"state": snap, "tail": tail}))
         torch.cuda.synchronize()
         stats: dict[str, Any] = {"prefill_s": round(time.perf_counter() - t0, 4), "cached": len(hit[0]) if hit else 0,
                                  "drafts": True}

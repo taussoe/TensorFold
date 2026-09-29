@@ -316,6 +316,33 @@ def test_prefill_chunks_and_resumes_give_the_same_state(sampling, kv_dtype):
     assert mtp_decode(e, first, 20, sampling, depth=4, confidence=0.0).tokens == ref
 
 
+@pytest.mark.parametrize("kv_dtype", ["bf16", "int8"])
+@pytest.mark.parametrize("sampling", [None, Sampling(seed=13, top_k=20, top_p=0.95)])
+def test_the_state_before_the_last_token_changes_nothing_and_resumes_the_next_turn(sampling, kv_dtype):
+    """``keep`` takes the state of the prompt but its last token: the prompt's own state, first token and drafted
+    reply stay a plain prefill's, and a next prompt that parts from it at that last token (a chat turn sent back
+    without its reasoning) resumes from the kept state to a fresh prefill's state and reply."""
+
+    w = _model()
+    prompt = [(37 * i + 11) % V for i in range(300)]
+    turn = prompt[:-1] + [(prompt[-1] + 1) % V] + [(13 * i + 5) % V for i in range(60)]
+    ref = {}
+    for name, p in (("prompt", prompt), ("turn", turn)):
+        e = Engine(w, capacity=1024, max_rows=8, prefill_rows=64, graphs=True, kv_dtype=kv_dtype)
+        first = prefill(e, p, sampling)
+        ref[name] = first, _state(e), serial_decode(e, first, 20, sampling).tokens
+        del e
+    e = Engine(w, capacity=1024, max_rows=8, prefill_rows=64, graphs=True, kv_dtype=kv_dtype)
+    kept = []
+    first = prefill(e, prompt, sampling, keep=lambda ids, snap, tail: kept.append((ids, {"state": snap, "tail": tail})))
+    assert [ids for ids, _ in kept] == [prompt[:-1]]
+    assert first == ref["prompt"][0] and all(torch.equal(a, b) for a, b in zip(_state(e), ref["prompt"][1]))
+    assert mtp_decode(e, first, 20, sampling, depth=4, confidence=0.0).tokens == ref["prompt"][2]
+    first = prefill(e, turn, sampling, resume=kept[0][1], keep=lambda *_: None)
+    assert first == ref["turn"][0] and all(torch.equal(a, b) for a, b in zip(_state(e), ref["turn"][1]))
+    assert mtp_decode(e, first, 20, sampling, depth=4, confidence=0.0).tokens == ref["turn"][2]
+
+
 @pytest.mark.parametrize("sampling", [None, Sampling(seed=21, top_k=20, top_p=0.95)])
 def test_the_family_hook_serves_the_recipe(tmp_path, sampling):
     """``cuda_engine``, what ``tensorfold serve`` calls, builds the measured recipe (up to 6 drafts, the 30% stop,
@@ -372,11 +399,12 @@ def test_prefix_reuse_and_the_serial_switch(tmp_path, sampling):
             ask(first)                                           # the first request's states again
         prompt = first + (reply if extend == "reply" else []) + [401, 33, 2048]
         warm, warm_stats = ask(prompt)
-        assert warm_stats["cached"] == len(first), (extend, warm_stats)     # prompt ends only: the reply prefills again
+        # the prompt but its last token is kept: the reply prefills again
+        assert warm_stats["cached"] == len(first) - 1, (extend, warm_stats)
         serial, serial_stats = ask(prompt, draft=False)          # one token a round, a fresh prefill
         assert serial == warm and serial_stats["drafts"] is False and serial_stats["cached"] == 0
         again, again_stats = ask(prompt + [9])                   # the kept states survived the serial request
-        assert again_stats["cached"] >= len(prompt)
+        assert again_stats["cached"] >= len(prompt) - 1
         ask([1500, 9, 10])                                       # an unrelated prompt: nothing to resume from
         cold, cold_stats = ask(prompt)
         assert cold_stats["cached"] == 0 and cold == warm, extend

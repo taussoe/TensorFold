@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field
-from typing import Sequence
+from typing import Callable, Sequence
 
 import numpy as np
 import torch
@@ -244,15 +244,45 @@ def draft(e: Engine, streams: torch.Tensor, next_tokens: Sequence[int], position
 
 
 @torch.no_grad()
+def _rows(e: Engine, prompt: Sequence[int], begin: int, end: int, use_mtp: bool, final: bool):
+    """Commit ``prompt[begin:end]`` in chunks, the MTP head absorbing each row's next token below ``end``; the last
+    chunk's logits when ``final``, and its last row's streams."""
+
+    w, st, pb = e.w, e.st, e.pbuf
+    last = streams_last = None
+    for start in range(begin, end, e.prefill_rows):
+        chunk = list(prompt[start:min(start + e.prefill_rows, end)])
+        R = len(chunk)
+        tail = start + R >= end
+        # only the prompt's last row is sampled: the head runs on the final chunk alone
+        logits = forward(w, st, pb, chunk, logits=final and tail)
+        if final and tail:
+            last = logits.clone()
+        streams_last = pb.streams[R - 1:R].clone()
+        if use_mtp:
+            nxt = list(prompt[start + 1:min(start + R + 1, end)])
+            if nxt:
+                mtp_forward(w, st, pb, nxt, pb.streams[:len(nxt)])
+                st.set_mtp_len(st.mtp_len + len(nxt))
+        commit(w, st, pb, R, R)
+    return last, streams_last
+
+
 def prefill(e: Engine, prompt: Sequence[int], sampling: Sampling | None, *, mtp: bool = True,
-            resume: dict | None = None) -> int:
-    """Commit the prompt in chunks, sample the first token; rows ignore chunking, so ``resume`` equals a fresh run."""
+            resume: dict | None = None, keep: Callable | None = None) -> int:
+    """Commit the prompt in chunks, sample the first token; rows ignore chunking, so ``resume`` equals a fresh run.
+
+    ``keep(ids, snapshot, tail)``: the state of the prompt but its last token, taken as if that were the whole
+    prompt. A chat prompt ends in ``<think>`` and a newline; the next turn sends the reply back without its reasoning,
+    an empty block whose two newlines are one token, so only that shorter prefix is one of the next prompt.
+    """
 
     if not prompt:
         raise ValueError("prefill requires at least one token")
     w, st, pb = e.w, e.st, e.pbuf
     use_mtp = mtp and w.mtp is not None and e.mbuf is not None
     begin = 0
+    tail = None
     if resume is None:
         e.reset()
     else:
@@ -260,25 +290,19 @@ def prefill(e: Engine, prompt: Sequence[int], sampling: Sampling | None, *, mtp:
         begin = st.pos
         if not 0 < begin < len(prompt):
             raise ValueError("a resumed prompt must extend the cached tokens")
-        if use_mtp and resume.get("tail") is not None:
-            mtp_forward(w, st, pb, [prompt[begin]], resume["tail"])
+        tail = resume.get("tail")
+    n = len(prompt)
+    if keep is not None and begin < n - 1:
+        if use_mtp and tail is not None:
+            mtp_forward(w, st, pb, [prompt[begin]], tail)
             st.set_mtp_len(st.mtp_len + 1)
-    last = None
-    for start in range(begin, len(prompt), e.prefill_rows):
-        chunk = list(prompt[start:start + e.prefill_rows])
-        R = len(chunk)
-        final = start + R >= len(prompt)
-        # only the prompt's last row is sampled: the head runs on the final chunk alone
-        logits = forward(w, st, pb, chunk, logits=final)
-        if final:
-            last = logits.clone()
-        streams_last = pb.streams[R - 1:R].clone()
-        if use_mtp:
-            nxt = list(prompt[start + 1:start + R + 1])
-            if nxt:
-                mtp_forward(w, st, pb, nxt, pb.streams[:len(nxt)])
-                st.set_mtp_len(st.mtp_len + len(nxt))
-        commit(w, st, pb, R, R)
+        _, tail = _rows(e, prompt, begin, n - 1, use_mtp, final=False)
+        keep(list(prompt[:n - 1]), st.snapshot(), tail if use_mtp else None)
+        begin = n - 1
+    if use_mtp and tail is not None and begin > 0:     # the resumed prefix's last row learns its next token
+        mtp_forward(w, st, pb, [prompt[begin]], tail)
+        st.set_mtp_len(st.mtp_len + 1)
+    last, streams_last = _rows(e, prompt, begin, n, use_mtp, final=True)
     first = e.sample(last, [len(prompt)], sampling)[0]
     e.last_streams = streams_last
     e.first = first

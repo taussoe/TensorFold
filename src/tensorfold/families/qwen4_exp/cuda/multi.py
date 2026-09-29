@@ -114,14 +114,14 @@ class MultiDecoder:
         e = _slot(self.w, st, self.buf, self.mbuf, self.pbuf, self.capacity)
         mtp = s.draft and self.depth > 0 and self.mbuf is not None
         try:
-            first = prefill(e, s.prompt, s.sampling, mtp=mtp, resume=resume)
+            # the state of the prompt but its last token; the MTP head has absorbed every position but that one's last
+            keep = (lambda ids, snap, tail: self._remember(ids, st, snap, tail)) if s.draft else None
+            first = prefill(e, s.prompt, s.sampling, mtp=mtp, resume=resume, keep=keep)
         except Exception:
             self.free.append(st)
             raise
         s.sid, s.st = self.next_id, st
         self.next_id += 1
-        if s.draft:                    # the prompt's state; the MTP head has absorbed every position but the last
-            self._remember(list(s.prompt), st, st.snapshot(), e.last_streams.clone() if mtp else None)
         s.context = list(s.prompt)
         s.drafts = draft(e, e.last_streams, [first], st.pos + 1, min(self.depth, s.count - 1), s.sampling,
                          self.confidence) if mtp and s.count > 1 else []
