@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from typing import Any, Callable
 
 from tensorfold.cuda.server import App, PreparedRequest, RequestError
@@ -11,11 +12,16 @@ from tensorfold.cuda.server import App, PreparedRequest, RequestError
 EFFORTS = {"minimal": "low", "low": "low", "medium": "high", "high": "high", "xhigh": "max", "max": "max"}
 
 
-def with_effort(body: dict[str, Any]) -> dict[str, Any]:
+def with_effort(body: dict[str, Any], default: str | None = None) -> dict[str, Any]:
     """The request with its ``reasoning_effort`` as template kwargs: "none" turns thinking off, a level picks the
-    template's Reasoning Effort line; explicit chat_template_kwargs win. Without it the template thinks at max."""
+    template's Reasoning Effort line; explicit chat_template_kwargs win. Without one, ``default``
+    (``TF_GLM_DEFAULT_EFFORT``) applies, and with neither the template thinks at max."""
 
     effort = body.get("reasoning_effort")
+    kwargs0 = body.get("chat_template_kwargs") or {}
+    if not isinstance(effort, str) and default and "reasoning_effort" not in kwargs0 and \
+            kwargs0.get("enable_thinking", True) is not False:
+        effort = default
     if not isinstance(effort, str):
         return body
     effort = effort.strip().lower()
@@ -57,7 +63,7 @@ class GlmApp(App):
             self.vision = Frontend(self.tok, engine.w.cfg.image_token)
 
     def _prepare(self, body: dict[str, Any], chat: bool) -> PreparedRequest:
-        return super()._prepare(with_effort(body), chat)
+        return super()._prepare(with_effort(body, os.environ.get("TF_GLM_DEFAULT_EFFORT") or None), chat)
 
     def check(self, body: dict[str, Any], *, prepared: PreparedRequest | None = None) -> str | None:
         """Validate the rendered prompt plus max_tokens against the engine context limit before streaming."""

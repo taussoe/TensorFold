@@ -23,3 +23,14 @@ def test_explicit_template_kwargs_win_and_unknown_values_pass():
     assert with_effort(body)["chat_template_kwargs"] == {"reasoning_effort": "max", "x": 1}
     for body in ({}, {"reasoning_effort": "ultra"}, {"reasoning_effort": 3}):
         assert with_effort(body) is body
+
+
+def test_a_server_default_applies_only_when_the_request_names_no_effort():
+    assert with_effort({}, "high")["chat_template_kwargs"] == {"reasoning_effort": "high"}
+    assert with_effort({"reasoning_effort": "low"}, "high")["chat_template_kwargs"] == {"reasoning_effort": "low"}
+    assert with_effort({"reasoning_effort": "none"}, "high")["chat_template_kwargs"] == {"enable_thinking": False}
+    off = {"chat_template_kwargs": {"enable_thinking": False}}
+    assert with_effort(off, "high") is off
+    asked = {"chat_template_kwargs": {"reasoning_effort": "max"}}
+    assert with_effort(asked, "high") is asked
+    assert with_effort({}, None) == {}
